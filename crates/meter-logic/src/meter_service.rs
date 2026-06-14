@@ -192,9 +192,8 @@ impl MeterService {
         // just inserted (or the pre-existing one on a redelivery). `mint_existing`
         // rejects an already-minted reading, so a retry never double-mints.
         let minted = match self.mint_existing(owner.user_id, reading_id).await {
-            Ok(_) => true,
-            // Already minted — idempotent success on redelivery.
-            Err(ApiError::Conflict(_)) => true,
+            // Minted now, or already minted (Conflict) — idempotent success on redelivery.
+            Ok(_) | Err(ApiError::Conflict(_)) => true,
             // Mint backend down/disabled — reading is saved, mint deferred.
             Err(ApiError::Unavailable(e)) => {
                 tracing::warn!("mint deferred for reading {reading_id}: {e}");
@@ -232,16 +231,18 @@ impl MeterService {
             ));
         }
 
-        let signature = self
+        let outcome = self
             .mint
             .mint(&info.wallet_address, info.kwh, &info.meter_serial, info.timestamp_ms)
             .await?;
 
-        self.repo.mark_reading_minted(reading_id, &signature).await?;
+        self.repo
+            .mark_reading_minted(reading_id, &outcome.signature, outcome.slot)
+            .await?;
 
         Ok(MintResponse {
             message: "Reading minted".to_string(),
-            transaction_signature: signature,
+            transaction_signature: outcome.signature,
             kwh_amount: info.kwh.to_string(),
             wallet_address: info.wallet_address,
         })

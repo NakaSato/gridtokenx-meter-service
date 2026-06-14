@@ -132,6 +132,17 @@ pub struct MintResponse {
     pub wallet_address: String,
 }
 
+/// Result of a successful on-chain mint, returned by the [`MintGateway`].
+///
+/// [`MintGateway`]: crate::traits::MintGateway
+#[derive(Debug, Clone)]
+pub struct MintOutcome {
+    /// On-chain transaction signature.
+    pub signature: String,
+    /// Slot the mint transaction landed in.
+    pub slot: u64,
+}
+
 /// Owner identity for a meter, resolved by serial number across all users.
 ///
 /// Used by the device-ingest path (NATS forward from the aggregator bridge),

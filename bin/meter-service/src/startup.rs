@@ -19,7 +19,7 @@ use meter_api::AppState;
 use meter_core::config::Config;
 use meter_core::traits::{MeterRepositoryTrait, MintGateway};
 use meter_logic::MeterService;
-use meter_persistence::{DisabledMintGateway, MeterRepository};
+use meter_persistence::{DisabledMintGateway, MeterRepository, NatsMintGateway};
 
 /// Connects dependencies and serves the meter service until the process exits.
 pub async fn run(config: Config) -> anyhow::Result<()> {
@@ -33,11 +33,31 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     info!("✅ Connected to Postgres");
 
     // 2. Repository + mint gateway (as traits) → service (DI).
-    //    No blockchain backend is configured for this service, so minting is
-    //    disabled (mint endpoints return 503). Swap in a NATS-backed gateway
-    //    once Chain Bridge access is provisioned.
+    //    Mint via Chain Bridge over NATS when MINT_VIA_CHAIN_BRIDGE is set and a
+    //    NATS URL is configured; otherwise minting is disabled (503). Degraded by
+    //    design: a NATS connect failure falls back to disabled, the API still serves.
     let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool));
-    let mint: Arc<dyn MintGateway> = Arc::new(DisabledMintGateway);
+    let mint: Arc<dyn MintGateway> = match (config.mint_via_chain_bridge, &config.nats_url) {
+        (true, Some(url)) => match async_nats::connect(url).await {
+            Ok(client) => {
+                info!("✅ mint via Chain Bridge enabled (NATS {url})");
+                Arc::new(NatsMintGateway::new(
+                    client,
+                    config.mint_service_identity.clone(),
+                    std::time::Duration::from_secs(30),
+                ))
+            }
+            Err(e) => {
+                tracing::warn!("mint backend NATS connect failed ({e}); minting disabled");
+                Arc::new(DisabledMintGateway)
+            }
+        },
+        (true, None) => {
+            tracing::warn!("MINT_VIA_CHAIN_BRIDGE set but NATS_URL unset; minting disabled");
+            Arc::new(DisabledMintGateway)
+        }
+        (false, _) => Arc::new(DisabledMintGateway),
+    };
     let meter_service = MeterService::new(repo, mint);
 
     // 2b. Device-reading consumer (aggregator bridge → meter-service mint

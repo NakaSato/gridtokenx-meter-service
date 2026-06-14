@@ -7,5 +7,5 @@ pub mod infra;
 /// SQLx-based PostgreSQL repositories.
 pub mod repository;
 
-pub use infra::DisabledMintGateway;
+pub use infra::{DisabledMintGateway, NatsMintGateway};
 pub use repository::MeterRepository;

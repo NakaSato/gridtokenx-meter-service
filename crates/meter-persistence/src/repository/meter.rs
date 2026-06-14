@@ -286,14 +286,28 @@ impl MeterRepositoryTrait for MeterRepository {
         &self,
         reading_id: Uuid,
         signature: &str,
+        slot: u64,
     ) -> Result<()> {
+        // Slot is a u64 on-chain but the column is int8; clamp the (impossible)
+        // overflow rather than wrapping negative.
+        let slot_i64 = i64::try_from(slot).unwrap_or(i64::MAX);
+        // Records the SUBMITTED mint (we have a signature + slot from the bridge).
+        // A BEFORE UPDATE trigger sets blockchain_status='submitted' and
+        // blockchain_submitted_at on the first tx-signature write, so we do not set
+        // them here. Finality (blockchain_status='confirmed', on_chain_confirmed,
+        // on_chain_confirmed_at) is left to a separate chain confirmer.
         sqlx::query(
             "UPDATE meter_readings
-             SET minted = true, mint_tx_signature = $2, updated_at = now()
+             SET minted = true,
+                 mint_tx_signature = $2,
+                 blockchain_tx_signature = $2,
+                 on_chain_slot = $3,
+                 updated_at = now()
              WHERE id = $1",
         )
         .bind(reading_id)
         .bind(signature)
+        .bind(slot_i64)
         .execute(&self.pool)
         .await?;
 

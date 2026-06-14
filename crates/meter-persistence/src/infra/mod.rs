@@ -3,4 +3,4 @@
 /// Mint gateway implementations.
 pub mod mint;
 
-pub use mint::DisabledMintGateway;
+pub use mint::{DisabledMintGateway, NatsMintGateway};

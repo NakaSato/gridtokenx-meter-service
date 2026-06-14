@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::domain::meter::{
-    Meter, MeterReading, MeterStats, ReadingMintInfo, ReadingOwner, RegisterMeterRequest,
+    Meter, MeterReading, MeterStats, MintOutcome, ReadingMintInfo, ReadingOwner,
+    RegisterMeterRequest,
 };
 use crate::error::Result;
 
@@ -80,11 +81,14 @@ pub trait MeterRepositoryTrait: Send + Sync {
         reading_id: Uuid,
     ) -> Result<Option<ReadingMintInfo>>;
 
-    /// Marks a reading minted, recording its on-chain signature.
+    /// Marks a reading minted, recording the submitted on-chain signature and
+    /// slot. A DB trigger advances `blockchain_status` to `submitted`; on-chain
+    /// finality is recorded later by a separate confirmer.
     async fn mark_reading_minted(
         &self,
         reading_id: Uuid,
         signature: &str,
+        slot: u64,
     ) -> Result<()>;
 }
 
@@ -96,12 +100,12 @@ pub trait MeterRepositoryTrait: Send + Sync {
 pub trait MintGateway: Send + Sync {
     /// Mints `kwh` energy tokens to `wallet_address` for the given meter.
     ///
-    /// Returns the on-chain transaction signature on success.
+    /// Returns the on-chain transaction signature and slot on success.
     async fn mint(
         &self,
         wallet_address: &str,
         kwh: f64,
         meter_serial: &str,
         timestamp_ms: i64,
-    ) -> Result<String>;
+    ) -> Result<MintOutcome>;
 }
