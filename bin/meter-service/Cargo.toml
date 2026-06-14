@@ -1,0 +1,31 @@
+[package]
+name = "gridtokenx-meter-service"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "meter-service"
+path = "src/main.rs"
+
+[dependencies]
+meter-core.workspace = true
+meter-persistence.workspace = true
+meter-logic.workspace = true
+meter-api.workspace = true
+
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+dotenvy.workspace = true
+async-nats.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

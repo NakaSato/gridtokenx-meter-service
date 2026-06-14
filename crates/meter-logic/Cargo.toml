@@ -1,0 +1,13 @@
+[package]
+name = "meter-logic"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+meter-core.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+tracing.workspace = true

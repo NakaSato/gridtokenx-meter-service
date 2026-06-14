@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+
+# Backup files from rustfmt
+**/*.rs.bk
+
+# MSVC debug info
+*.pdb
+
+# Environment / secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

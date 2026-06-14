@@ -1,0 +1,14 @@
+[package]
+name = "meter-persistence"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+meter-core.workspace = true
+async-trait.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+tracing.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "meter-api"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+meter-core.workspace = true
+meter-logic.workspace = true
+axum.workspace = true
+jsonwebtoken.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
