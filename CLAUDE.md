@@ -28,6 +28,9 @@ Two ingress paths feed the same core service:
 
 ## Build, run, test
 
+See **[TESTING.md](TESTING.md)** for the map of *critical point → exact test command*
+(which test covers what, and the env each integration test needs).
+
 Each `gridtokenx-*` service is its **own Cargo workspace** — `cd` into this dir first; never
 `cargo` from the superproject root.
 

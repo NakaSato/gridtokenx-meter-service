@@ -11,3 +11,6 @@ meter-core.workspace = true
 async-trait.workspace = true
 uuid.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
