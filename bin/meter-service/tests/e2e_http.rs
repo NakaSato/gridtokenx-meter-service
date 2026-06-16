@@ -32,14 +32,14 @@ use uuid::Uuid;
 
 use gridtokenx_meter_service::startup::build_app;
 use meter_api::{AppState, ReadingEvent};
+use meter_core::domain::meter::MeterReading;
 use meter_core::traits::MeterRepositoryTrait;
 use meter_logic::MeterService;
 use meter_persistence::MeterRepository;
 
 const DEFAULT_DB: &str =
     "postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx";
-const DEFAULT_SECRET: &str =
-    "dev-jwt-secret-key-minimum-32-characters-long-for-development-2025";
+const DEFAULT_SECRET: &str = "dev-jwt-secret-key-minimum-32-characters-long-for-development-2025";
 
 /// HS256 JWT with `sub` + `exp`, matching what the auth extractor verifies.
 fn mint_jwt(user_id: Uuid, secret: &str) -> String {
@@ -137,11 +137,7 @@ async fn http_e2e_register_submit_stream_stats() {
 
 /// The assertions, isolated so the caller can clean up regardless of outcome.
 #[allow(clippy::too_many_lines)]
-async fn run_flow(
-    app: &axum::Router,
-    token: &str,
-    serial: &str,
-) -> Result<(), String> {
+async fn run_flow(app: &axum::Router, token: &str, serial: &str) -> Result<(), String> {
     macro_rules! check {
         ($cond:expr, $($arg:tt)*) => {
             if !$cond { return Err(format!($($arg)*)); }
@@ -151,10 +147,19 @@ async fn run_flow(
     // 1. health
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/health").body(Body::empty()).expect("req"))
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .expect("req"),
+        )
         .await
         .expect("health");
-    check!(resp.status() == StatusCode::OK, "health status {}", resp.status());
+    check!(
+        resp.status() == StatusCode::OK,
+        "health status {}",
+        resp.status()
+    );
 
     // 2. register
     let resp = app
@@ -171,10 +176,20 @@ async fn run_flow(
         ))
         .await
         .expect("register");
-    check!(resp.status() == StatusCode::OK, "register status {}", resp.status());
+    check!(
+        resp.status() == StatusCode::OK,
+        "register status {}",
+        resp.status()
+    );
     let v = json_body(resp).await;
-    check!(v["success"] == serde_json::json!(true), "register not success: {v}");
-    check!(v["meter"]["serial_number"] == serde_json::json!(serial), "serial mismatch: {v}");
+    check!(
+        v["success"] == serde_json::json!(true),
+        "register not success: {v}"
+    );
+    check!(
+        v["meter"]["serial_number"] == serde_json::json!(serial),
+        "serial mismatch: {v}"
+    );
 
     // 3. subscribe SSE BEFORE submitting so the broadcast subscription is live.
     let stream_resp = app
@@ -182,7 +197,11 @@ async fn run_flow(
         .oneshot(authed("GET", "/api/v1/meters/readings/stream", token, None))
         .await
         .expect("stream");
-    check!(stream_resp.status() == StatusCode::OK, "stream status {}", stream_resp.status());
+    check!(
+        stream_resp.status() == StatusCode::OK,
+        "stream status {}",
+        stream_resp.status()
+    );
     let mut events = stream_resp.into_body().into_data_stream();
 
     // 4. submit a reading
@@ -196,7 +215,11 @@ async fn run_flow(
         ))
         .await
         .expect("submit");
-    check!(resp.status() == StatusCode::OK, "submit status {}", resp.status());
+    check!(
+        resp.status() == StatusCode::OK,
+        "submit status {}",
+        resp.status()
+    );
     let reading = json_body(resp).await;
     let reading_id = reading["id"].as_str().unwrap_or_default().to_string();
     check!(!reading_id.is_empty(), "submit returned no id: {reading}");
@@ -219,7 +242,10 @@ async fn run_flow(
     })
     .await
     .unwrap_or(false);
-    check!(got, "SSE did not deliver reading {reading_id}; got: {sse_text}");
+    check!(
+        got,
+        "SSE did not deliver reading {reading_id}; got: {sse_text}"
+    );
     check!(
         sse_text.contains("\"mint_status\":\"pending\""),
         "SSE event missing mint_status: {sse_text}"
@@ -228,10 +254,19 @@ async fn run_flow(
     // 6. readings list contains it with mint_status.
     let resp = app
         .clone()
-        .oneshot(authed("GET", "/api/v1/meters/readings?limit=10", token, None))
+        .oneshot(authed(
+            "GET",
+            "/api/v1/meters/readings?limit=10",
+            token,
+            None,
+        ))
         .await
         .expect("readings");
-    check!(resp.status() == StatusCode::OK, "readings status {}", resp.status());
+    check!(
+        resp.status() == StatusCode::OK,
+        "readings status {}",
+        resp.status()
+    );
     let list = json_body(resp).await;
     let arr = list.as_array().cloned().unwrap_or_default();
     let found = arr
@@ -249,7 +284,11 @@ async fn run_flow(
         .oneshot(authed("GET", "/api/v1/meters/stats", token, None))
         .await
         .expect("stats");
-    check!(resp.status() == StatusCode::OK, "stats status {}", resp.status());
+    check!(
+        resp.status() == StatusCode::OK,
+        "stats status {}",
+        resp.status()
+    );
     let stats = json_body(resp).await;
     for key in ["minted_count", "pending_count", "denied_count"] {
         check!(stats[key].is_i64(), "stats.{key} not an integer: {stats}");
@@ -257,6 +296,116 @@ async fn run_flow(
     check!(
         stats["pending_count"].as_i64().unwrap_or(0) >= 1,
         "pending_count should count our reading: {stats}"
+    );
+
+    Ok(())
+}
+
+/// Wallet fallback + serial normalization, verified at the persisted DB row
+/// (the HTTP `MeterReading` response does not expose `wallet_address`). Register
+/// serial `S`; submit to a whitespace-padded `" S "` with a BLANK wallet; assert
+/// the stored row credits the meter owner's wallet and stores the trimmed serial.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn http_e2e_wallet_fallback_and_serial_norm() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+
+    // Need the user's wallet to assert the fallback credited it.
+    let row: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, wallet_address FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query user");
+    let Some((user_id, owner_wallet)) = row else {
+        eprintln!("SKIP: no wallet-bearing user in DB");
+        return;
+    };
+
+    let token = mint_jwt(user_id, &secret);
+    let serial = format!("E2E-WAL-{}", Uuid::new_v4());
+
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let result = run_wallet_fallback(&app, &pool, &token, &serial, &owner_wallet).await;
+    cleanup(&pool, &serial).await;
+    result.expect("wallet-fallback flow");
+}
+
+async fn run_wallet_fallback(
+    app: &axum::Router,
+    pool: &PgPool,
+    token: &str,
+    serial: &str,
+    owner_wallet: &str,
+) -> Result<(), String> {
+    macro_rules! check {
+        ($cond:expr, $($arg:tt)*) => {
+            if !$cond { return Err(format!($($arg)*)); }
+        };
+    }
+
+    register(app, token, serial).await?;
+
+    // Submit to a PADDED serial with a BLANK wallet → fallback + trim must apply.
+    // Spaces are percent-encoded in the path; axum's `Path` decodes them back to
+    // "  SERIAL  ", which `submit_reading` then trims.
+    let padded = format!("%20%20{serial}%20%20");
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/v1/meters/{padded}/readings"),
+            token,
+            Some(serde_json::json!({ "kwh": 2.5, "wallet_address": "   " })),
+        ))
+        .await
+        .expect("submit");
+    check!(
+        resp.status() == StatusCode::OK,
+        "submit status {}",
+        resp.status()
+    );
+    let reading = json_body(resp).await;
+    let reading_id = reading["id"].as_str().unwrap_or_default().to_string();
+    check!(!reading_id.is_empty(), "submit returned no id: {reading}");
+    // The padded path serial must resolve and surface as the trimmed serial.
+    check!(
+        reading["meter_serial"] == serde_json::json!(serial),
+        "response serial not trimmed: {reading}"
+    );
+
+    // Verify the persisted row: wallet fell back to owner, serial stored trimmed.
+    let rid = Uuid::parse_str(&reading_id).map_err(|e| format!("bad reading id: {e}"))?;
+    let stored: Option<(String, String)> =
+        sqlx::query_as("SELECT wallet_address, meter_serial FROM meter_readings WHERE id = $1")
+            .bind(rid)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("query reading: {e}"))?;
+    let (stored_wallet, stored_serial) = stored.ok_or("reading row not found")?;
+    check!(
+        stored_wallet == owner_wallet,
+        "wallet fallback failed: stored '{stored_wallet}' != owner '{owner_wallet}'"
+    );
+    check!(
+        stored_serial == serial,
+        "serial not stored trimmed: stored '{stored_serial}' != '{serial}'"
     );
 
     Ok(())
@@ -319,13 +468,20 @@ async fn run_my_meters(app: &axum::Router, token: &str, serial: &str) -> Result<
         .oneshot(authed("GET", "/api/v1/me/meters", token, None))
         .await
         .expect("my meters");
-    check!(resp.status() == StatusCode::OK, "my-meters status {}", resp.status());
+    check!(
+        resp.status() == StatusCode::OK,
+        "my-meters status {}",
+        resp.status()
+    );
     let meters = json_body(resp).await;
     let arr = meters.as_array().cloned().unwrap_or_default();
     let mine = arr
         .iter()
         .find(|m| m["serial_number"] == serde_json::json!(serial));
-    check!(mine.is_some(), "registered meter {serial} absent from /me/meters: {meters}");
+    check!(
+        mine.is_some(),
+        "registered meter {serial} absent from /me/meters: {meters}"
+    );
 
     Ok(())
 }
@@ -491,7 +647,12 @@ async fn submit(app: &axum::Router, token: &str, serial: &str, kwh: f64) -> Resu
 async fn reading_ids(app: &axum::Router, token: &str) -> Result<Vec<String>, String> {
     let resp = app
         .clone()
-        .oneshot(authed("GET", "/api/v1/meters/readings?limit=200", token, None))
+        .oneshot(authed(
+            "GET",
+            "/api/v1/meters/readings?limit=200",
+            token,
+            None,
+        ))
         .await
         .expect("readings");
     if resp.status() != StatusCode::OK {
@@ -530,7 +691,10 @@ async fn http_e2e_multi_user_isolation() {
     .await
     .expect("query users");
     if users.len() < 2 {
-        eprintln!("SKIP: need 2 wallet-bearing users in DB, found {}", users.len());
+        eprintln!(
+            "SKIP: need 2 wallet-bearing users in DB, found {}",
+            users.len()
+        );
         return;
     }
     let (user_a, user_b) = (users[0], users[1]);
@@ -575,10 +739,19 @@ async fn run_isolation(
     // A opens its SSE stream BEFORE any submit so both readings are in the window.
     let stream_resp = app
         .clone()
-        .oneshot(authed("GET", "/api/v1/meters/readings/stream", token_a, None))
+        .oneshot(authed(
+            "GET",
+            "/api/v1/meters/readings/stream",
+            token_a,
+            None,
+        ))
         .await
         .expect("stream");
-    check!(stream_resp.status() == StatusCode::OK, "stream status {}", stream_resp.status());
+    check!(
+        stream_resp.status() == StatusCode::OK,
+        "stream status {}",
+        stream_resp.status()
+    );
     let mut events = stream_resp.into_body().into_data_stream();
 
     // B submits FIRST, then A. Broadcast preserves order, so by the time A's own
@@ -601,7 +774,10 @@ async fn run_isolation(
     })
     .await
     .unwrap_or(false);
-    check!(got_a, "A's own reading {id_a} never arrived on A's stream; got: {sse_text}");
+    check!(
+        got_a,
+        "A's own reading {id_a} never arrived on A's stream; got: {sse_text}"
+    );
     check!(
         !sse_text.contains(&id_b),
         "LEAK: B's reading {id_b} appeared on A's SSE stream: {sse_text}"
@@ -609,14 +785,86 @@ async fn run_isolation(
 
     // List scoping: A sees its own reading, never B's; and vice versa.
     let a_ids = reading_ids(app, token_a).await?;
-    check!(a_ids.contains(&id_a), "A's list missing its own reading {id_a}");
-    check!(!a_ids.contains(&id_b), "LEAK: A's list contains B's reading {id_b}");
+    check!(
+        a_ids.contains(&id_a),
+        "A's list missing its own reading {id_a}"
+    );
+    check!(
+        !a_ids.contains(&id_b),
+        "LEAK: A's list contains B's reading {id_b}"
+    );
 
     let b_ids = reading_ids(app, token_b).await?;
-    check!(b_ids.contains(&id_b), "B's list missing its own reading {id_b}");
-    check!(!b_ids.contains(&id_a), "LEAK: B's list contains A's reading {id_a}");
+    check!(
+        b_ids.contains(&id_b),
+        "B's list missing its own reading {id_b}"
+    );
+    check!(
+        !b_ids.contains(&id_a),
+        "LEAK: B's list contains A's reading {id_a}"
+    );
 
     Ok(())
+}
+
+/// Framework-level rejections, infra-free (lazy pool): an unknown route is 404,
+/// and a malformed JSON body on a real route is rejected (4xx) before the
+/// handler touches the DB. Auth runs before the `Json` extractor, so the
+/// malformed-body case carries a valid token.
+#[tokio::test]
+async fn malformed_body_and_unknown_route() {
+    let secret = "test-secret-minimum-32-characters-long-aaaaaaaaaa";
+    let pool = PgPool::connect_lazy(DEFAULT_DB).expect("lazy pool");
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_secs();
+    let token = mint_jwt_with_exp(Uuid::new_v4(), secret, now + 3600);
+
+    // Unknown route → 404 (router miss; no auth involved).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/does-not-exist")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "unknown route should be 404"
+    );
+
+    // Malformed JSON on POST /api/v1/meters with a VALID token: the Json
+    // extractor rejects with a client error (400) before the handler runs, so
+    // the lazy DB is never touched.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/meters")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{ this is not json"))
+        .expect("req");
+    let resp = app.clone().oneshot(req).await.expect("oneshot");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "malformed JSON should be 400, got {}",
+        resp.status()
+    );
 }
 
 /// Every protected route must reject a request whose JWT is missing, malformed,
@@ -668,12 +916,24 @@ async fn auth_rejects_bad_tokens() {
     let expired_tok = mint_jwt_with_exp(user, secret, now - 3600);
     let expired = authed("GET", "/api/v1/meters/stats", &expired_tok, None);
 
+    // Correctly signed, unexpired — but `sub` is not a UUID, so the `Claims`
+    // deserialize fails inside the extractor → still 401.
+    let bad_sub_claims = serde_json::json!({ "sub": "not-a-uuid", "exp": now + 3600 });
+    let bad_sub_tok = encode(
+        &Header::new(Algorithm::HS256),
+        &bad_sub_claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .expect("encode bad-sub jwt");
+    let bad_sub = authed("GET", "/api/v1/meters/stats", &bad_sub_tok, None);
+
     let cases = [
         ("missing header", no_header),
         ("non-Bearer scheme", no_bearer),
         ("garbage token", garbage),
         ("wrong signature", wrong_sig),
         ("expired token", expired),
+        ("non-UUID sub", bad_sub),
     ];
 
     for (name, req) in cases {
@@ -688,6 +948,728 @@ async fn auth_rejects_bad_tokens() {
     // Valid-token acceptance is covered by the live e2e tests (which exercise
     // the full DB-backed handler). Adding it here would force a DB connection
     // (and a long acquire timeout when no Postgres is up), so it's omitted.
+}
+
+/// Authz: a user must NOT be able to submit a reading to a meter owned by
+/// someone else. B registers a serial; A POSTs a reading to that exact serial.
+/// The meter lookup is user-scoped (`find_meter_by_serial` filters by `user_id`),
+/// so for A the serial is unknown → 404. A regression dropping that `user_id`
+/// filter would let A write readings against B's meter — a silent authz hole
+/// that the read-only isolation test cannot catch.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn http_e2e_cross_user_submit_forbidden() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+
+    let users: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 2",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("query users");
+    if users.len() < 2 {
+        eprintln!(
+            "SKIP: need 2 wallet-bearing users in DB, found {}",
+            users.len()
+        );
+        return;
+    }
+    let (user_a, user_b) = (users[0], users[1]);
+
+    let token_a = mint_jwt(user_a, &secret);
+    let token_b = mint_jwt(user_b, &secret);
+    let serial_b = format!("E2E-XUSER-B-{}", Uuid::new_v4());
+
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let result = run_cross_user_submit(&app, &pool, &token_a, &token_b, &serial_b).await;
+    cleanup(&pool, &serial_b).await;
+    result.expect("cross-user submit flow");
+}
+
+async fn run_cross_user_submit(
+    app: &axum::Router,
+    pool: &PgPool,
+    token_a: &str,
+    token_b: &str,
+    serial_b: &str,
+) -> Result<(), String> {
+    macro_rules! check {
+        ($cond:expr, $($arg:tt)*) => {
+            if !$cond { return Err(format!($($arg)*)); }
+        };
+    }
+
+    // B owns the meter.
+    register(app, token_b, serial_b).await?;
+
+    // A submits to B's serial → must be 404 (serial is unknown in A's scope).
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/v1/meters/{serial_b}/readings"),
+            token_a,
+            Some(serde_json::json!({ "kwh": 9.9 })),
+        ))
+        .await
+        .expect("cross submit");
+    check!(
+        resp.status() == StatusCode::NOT_FOUND,
+        "cross-user submit: expected 404, got {}",
+        resp.status()
+    );
+
+    // No row may have leaked through under B's meter. Asserted by serial (unique
+    // to this test) — parallel-safe, unlike checking B's whole list (B is a real
+    // user with history).
+    let leaked: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM meter_readings WHERE meter_serial = $1")
+            .bind(serial_b)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("count readings: {e}"))?;
+    check!(
+        leaked == 0,
+        "forbidden submit leaked {leaked} reading(s) under B's meter {serial_b}"
+    );
+
+    Ok(())
+}
+
+/// Synthetic-injection proof of the read-only `mint_status` derivation. Inserts
+/// one minted row (`minted = true` + a tx signature) and one denied row
+/// (`blockchain_status = 'failed'`) straight into the shared table for a
+/// throwaway serial, then asserts the HTTP read paths surface them: the readings
+/// list `mint_status` + `mint_tx_signature`, and the stats `minted_count` /
+/// `denied_count`. These two branches of `MINT_STATUS_CASE` have NO other
+/// automated coverage — every other path only exercises the `pending` branch
+/// (this service only ever inserts unminted rows; mint/deny columns are written
+/// by other services). Self-cleaning: `cleanup` deletes both rows by serial.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn http_e2e_mint_status_minted_and_denied() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query user");
+    let Some(user_id) = user_id else {
+        eprintln!("SKIP: no wallet-bearing user in DB");
+        return;
+    };
+
+    let token = mint_jwt(user_id, &secret);
+    let serial = format!("E2E-MINT-{}", Uuid::new_v4());
+
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let result = run_mint_status(&app, &pool, &token, &serial, user_id).await;
+    cleanup(&pool, &serial).await;
+    result.expect("mint-status flow");
+}
+
+/// Insert a synthetic `meter_readings` row with explicit mint columns, returning
+/// its id. Bypasses the service (which only writes unminted rows) to forge the
+/// minted/denied states other services would write. `energy_generated`/
+/// `energy_consumed` are left 0 so this row never perturbs the SUM-aggregate
+/// deltas asserted by other tests sharing this user under parallel runs.
+async fn inject_reading(
+    pool: &PgPool,
+    user_id: Uuid,
+    serial: &str,
+    minted: bool,
+    tx_sig: Option<&str>,
+    blockchain_status: Option<&str>,
+) -> Result<String, String> {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO meter_readings
+            (id, user_id, wallet_address, meter_serial, kwh_amount, timestamp,
+             energy_generated, minted, mint_tx_signature, blockchain_status)
+         VALUES
+            (gen_random_uuid(), $1, 'E2E-INJECT', $2, 0, now(),
+             0, $3, $4, $5)
+         RETURNING id",
+    )
+    .bind(user_id)
+    .bind(serial)
+    .bind(minted)
+    .bind(tx_sig)
+    .bind(blockchain_status)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("inject reading: {e}"))?;
+    Ok(id.to_string())
+}
+
+/// GET stats, returning `(minted_count, denied_count)`.
+async fn stats_counts(app: &axum::Router, token: &str) -> Result<(i64, i64), String> {
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/api/v1/meters/stats", token, None))
+        .await
+        .expect("stats");
+    if resp.status() != StatusCode::OK {
+        return Err(format!("stats status {}", resp.status()));
+    }
+    let s = json_body(resp).await;
+    let minted = s["minted_count"].as_i64().ok_or("minted_count not i64")?;
+    let denied = s["denied_count"].as_i64().ok_or("denied_count not i64")?;
+    Ok((minted, denied))
+}
+
+async fn run_mint_status(
+    app: &axum::Router,
+    pool: &PgPool,
+    token: &str,
+    serial: &str,
+    user_id: Uuid,
+) -> Result<(), String> {
+    macro_rules! check {
+        ($cond:expr, $($arg:tt)*) => {
+            if !$cond { return Err(format!($($arg)*)); }
+        };
+    }
+
+    register(app, token, serial).await?;
+
+    // Baseline counts BEFORE injection; assert monotone +1 lower bounds after, so
+    // concurrent additions from other ignored tests / live services can't flake it.
+    let (base_minted, base_denied) = stats_counts(app, token).await?;
+
+    let sig = format!("E2E_SIG_{}", Uuid::new_v4().simple());
+    let id_minted =
+        inject_reading(pool, user_id, serial, true, Some(&sig), Some("confirmed")).await?;
+    let id_denied = inject_reading(pool, user_id, serial, false, None, Some("failed")).await?;
+
+    // Read both back through the HTTP list and locate them by id.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            "/api/v1/meters/readings?limit=200",
+            token,
+            None,
+        ))
+        .await
+        .expect("readings");
+    check!(
+        resp.status() == StatusCode::OK,
+        "readings status {}",
+        resp.status()
+    );
+    let list = json_body(resp).await;
+    let arr = list.as_array().cloned().unwrap_or_default();
+    let find = |id: &str| {
+        arr.iter()
+            .find(|r| r["id"] == serde_json::json!(id))
+            .cloned()
+    };
+
+    // Minted row: mint_status == "minted" AND the tx signature is surfaced.
+    let minted = find(&id_minted).ok_or("injected minted row absent from list")?;
+    check!(
+        minted["mint_status"] == serde_json::json!("minted"),
+        "minted row not 'minted': {minted}"
+    );
+    check!(
+        minted["mint_tx_signature"] == serde_json::json!(sig),
+        "minted row missing/wrong mint_tx_signature: {minted}"
+    );
+
+    // Denied row: mint_status == "denied" AND no signature (field omitted → null).
+    let denied = find(&id_denied).ok_or("injected denied row absent from list")?;
+    check!(
+        denied["mint_status"] == serde_json::json!("denied"),
+        "denied row not 'denied': {denied}"
+    );
+    check!(
+        denied["mint_tx_signature"].is_null(),
+        "denied row should have no mint_tx_signature: {denied}"
+    );
+
+    // Stats counters reflect both injected rows (lower bound: ≥ baseline + 1).
+    let (minted_count, denied_count) = stats_counts(app, token).await?;
+    check!(
+        minted_count > base_minted,
+        "minted_count did not rise: {minted_count} <= {base_minted}"
+    );
+    check!(
+        denied_count > base_denied,
+        "denied_count did not rise: {denied_count} <= {base_denied}"
+    );
+
+    Ok(())
+}
+
+/// Pagination through HTTP: `?limit` caps the page exactly, and out-of-range
+/// `limit`/`offset` are clamped (not errors). Logic-unit-tested already; this
+/// proves the query-param parse + clamp survive the real HTTP path.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn http_e2e_pagination() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query user");
+    let Some(user_id) = user_id else {
+        eprintln!("SKIP: no wallet-bearing user in DB");
+        return;
+    };
+
+    let token = mint_jwt(user_id, &secret);
+    let serial = format!("E2E-PAGE-{}", Uuid::new_v4());
+
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let result = run_pagination(&app, &token, &serial).await;
+    cleanup(&pool, &serial).await;
+    result.expect("pagination flow");
+}
+
+async fn run_pagination(app: &axum::Router, token: &str, serial: &str) -> Result<(), String> {
+    macro_rules! check {
+        ($cond:expr, $($arg:tt)*) => {
+            if !$cond { return Err(format!($($arg)*)); }
+        };
+    }
+
+    register(app, token, serial).await?;
+    // Three readings so the user has >= 2 (list is user-scoped, not serial-scoped).
+    submit(app, token, serial, 1.0).await?;
+    submit(app, token, serial, 2.0).await?;
+    submit(app, token, serial, 3.0).await?;
+
+    let list_len = |query: &str| {
+        let app = app.clone();
+        let req = authed(
+            "GET",
+            &format!("/api/v1/meters/readings{query}"),
+            token,
+            None,
+        );
+        async move {
+            let resp = app.oneshot(req).await.expect("readings");
+            let status = resp.status();
+            let body = json_body(resp).await;
+            (status, body.as_array().map_or(0, Vec::len))
+        }
+    };
+
+    // Exact page cap.
+    let (status, len) = list_len("?limit=2").await;
+    check!(status == StatusCode::OK, "limit=2 status {status}");
+    check!(len == 2, "limit=2 should return exactly 2, got {len}");
+
+    // Over-max limit clamps to 500 server-side: still 200, not an error.
+    let (status, _) = list_len("?limit=99999").await;
+    check!(status == StatusCode::OK, "huge limit status {status}");
+
+    // Negative offset clamps to 0: still 200.
+    let (status, _) = list_len("?limit=10&offset=-5").await;
+    check!(status == StatusCode::OK, "negative offset status {status}");
+
+    Ok(())
+}
+
+/// Reading projection of the optional energy fields + stats SUM aggregates.
+/// `submit_reading` only persists `kwh`, so inject a row with explicit
+/// `energy_generated`/`energy_consumed`/`voltage`/`current` (as other services
+/// write), then assert the HTTP list surfaces them and stats sums move by the
+/// exact injected amounts (before/after delta, robust to other rows).
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn http_e2e_reading_fields_and_aggregates() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query user");
+    let Some(user_id) = user_id else {
+        eprintln!("SKIP: no wallet-bearing user in DB");
+        return;
+    };
+
+    let token = mint_jwt(user_id, &secret);
+    let serial = format!("E2E-FIELDS-{}", Uuid::new_v4());
+
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let result = run_reading_fields(&app, &pool, &token, &serial, user_id).await;
+    cleanup(&pool, &serial).await;
+    result.expect("reading-fields flow");
+}
+
+// The `check!` macro expands to `if !$cond`; the float-tolerance asserts below
+// compare partially-ordered f64s, which trips `neg_cmp_op_on_partial_ord`.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+#[allow(clippy::too_many_lines)]
+async fn run_reading_fields(
+    app: &axum::Router,
+    pool: &PgPool,
+    token: &str,
+    serial: &str,
+    user_id: Uuid,
+) -> Result<(), String> {
+    macro_rules! check {
+        ($cond:expr, $($arg:tt)*) => {
+            if !$cond { return Err(format!($($arg)*)); }
+        };
+    }
+    // f64 JSON compare with tolerance.
+    let approx =
+        |v: &serde_json::Value, want: f64| v.as_f64().is_some_and(|g| (g - want).abs() < 1e-6);
+
+    register(app, token, serial).await?;
+
+    // Inject a row with explicit optional fields (other services write these).
+    let (gen, con, volt, cur) = (10.5_f64, 4.25_f64, 230.0_f64, 5.5_f64);
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO meter_readings
+            (id, user_id, wallet_address, meter_serial, kwh_amount, timestamp,
+             energy_generated, energy_consumed, voltage, current, minted)
+         VALUES
+            (gen_random_uuid(), $1, 'E2E-FIELDS', $2, $3, now(), $3, $4, $5, $6, false)
+         RETURNING id",
+    )
+    .bind(user_id)
+    .bind(serial)
+    .bind(gen)
+    .bind(con)
+    .bind(volt)
+    .bind(cur)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("inject reading: {e}"))?;
+    let id = id.to_string();
+
+    // List surfaces the optional fields.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            "/api/v1/meters/readings?limit=200",
+            token,
+            None,
+        ))
+        .await
+        .expect("readings");
+    check!(
+        resp.status() == StatusCode::OK,
+        "readings status {}",
+        resp.status()
+    );
+    let list = json_body(resp).await;
+    let arr = list.as_array().cloned().unwrap_or_default();
+    let row = arr
+        .iter()
+        .find(|r| r["id"] == serde_json::json!(id))
+        .ok_or("injected row absent from list")?;
+    check!(
+        approx(&row["energy_generated"], gen),
+        "energy_generated wrong: {row}"
+    );
+    check!(
+        approx(&row["energy_consumed"], con),
+        "energy_consumed wrong: {row}"
+    );
+    check!(approx(&row["voltage"], volt), "voltage wrong: {row}");
+    check!(approx(&row["current"], cur), "current wrong: {row}");
+
+    // Aggregate SUM correctness, scoped to THIS serial so concurrent ignored
+    // tests sharing the borrowed user can't skew it (the /stats endpoint is
+    // user-scoped and thus racy for an exact delta). Same SUM SQL shape as the
+    // repository's `user_stats`.
+    let (sum_gen, sum_con): (f64, f64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(energy_generated), 0)::float8,
+                COALESCE(SUM(energy_consumed),  0)::float8
+         FROM meter_readings WHERE meter_serial = $1",
+    )
+    .bind(serial)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("sum query: {e}"))?;
+    check!(
+        (sum_gen - gen).abs() < 1e-6,
+        "SUM(energy_generated) {sum_gen} != {gen}"
+    );
+    check!(
+        (sum_con - con).abs() < 1e-6,
+        "SUM(energy_consumed) {sum_con} != {con}"
+    );
+
+    // The /stats endpoint still returns well-formed aggregates (shape, not exact
+    // value — value is racy across the shared user).
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/api/v1/meters/stats", token, None))
+        .await
+        .expect("stats");
+    check!(
+        resp.status() == StatusCode::OK,
+        "stats status {}",
+        resp.status()
+    );
+    let stats = json_body(resp).await;
+    check!(
+        stats["total_produced"].is_number(),
+        "total_produced not number: {stats}"
+    );
+    check!(
+        stats["total_consumed"].is_number(),
+        "total_consumed not number: {stats}"
+    );
+    check!(
+        stats["last_reading_time"].is_string(),
+        "last_reading_time missing: {stats}"
+    );
+
+    Ok(())
+}
+
+/// SSE lagged-subscriber invariant (CLAUDE.md): a slow subscriber that overruns
+/// the broadcast channel capacity SKIPS the missed events rather than having its
+/// stream closed. Infra-free: a tiny-capacity channel is flooded BEFORE the
+/// subscriber reads, forcing a `Lagged`, which the handler swallows. The stream
+/// must stay open and still deliver a later event.
+#[tokio::test]
+async fn sse_lagged_subscriber_skips_not_closes() {
+    let secret = "test-secret-minimum-32-characters-long-aaaaaaaaaa";
+    let pool = PgPool::connect_lazy(DEFAULT_DB).expect("lazy pool");
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool));
+    // Tiny capacity so a handful of unread events overruns it → Lagged.
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(4);
+    let tx = readings_tx.clone();
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_secs();
+    let user = Uuid::new_v4();
+    let token = mint_jwt_with_exp(user, secret, now + 3600);
+
+    // Subscribe first (registers the receiver), but do NOT read yet.
+    let stream_resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            "/api/v1/meters/readings/stream",
+            &token,
+            None,
+        ))
+        .await
+        .expect("stream");
+    assert_eq!(stream_resp.status(), StatusCode::OK, "stream status");
+    let mut events = stream_resp.into_body().into_data_stream();
+
+    // Flood well past capacity (4) for THIS user while nothing is consuming →
+    // the receiver lags. The last event's id is what must still arrive.
+    let mut last_id = String::new();
+    for i in 0..12 {
+        let mut r = sample_reading();
+        let id = Uuid::new_v4();
+        r.id = id;
+        r.kwh = f64::from(i);
+        last_id = id.to_string();
+        let _ = tx.send(Arc::new(ReadingEvent {
+            user_id: user,
+            reading: r,
+        }));
+    }
+
+    // The stream must NOT have closed: after swallowing the Lagged error it
+    // should still yield one of the retained (later) events.
+    let mut sse_text = String::new();
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = events.next().await {
+            let bytes = chunk.expect("sse chunk");
+            sse_text.push_str(&String::from_utf8_lossy(&bytes));
+            if sse_text.contains(&last_id) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        got,
+        "lagged stream closed or never delivered the retained event {last_id}; got: {sse_text}"
+    );
+}
+
+/// A minimal `MeterReading` for broadcasting directly into the SSE channel
+/// (no DB row required).
+fn sample_reading() -> MeterReading {
+    MeterReading {
+        id: Uuid::nil(),
+        meter_serial: "SSE-LAG".to_string(),
+        kwh: 0.0,
+        timestamp: String::new(),
+        submitted_at: String::new(),
+        energy_generated: None,
+        energy_consumed: None,
+        voltage: None,
+        current: None,
+        mint_status: "pending".to_string(),
+        mint_tx_signature: None,
+    }
+}
+
+/// `/health` returns 200 with the `"ok"` body, and the permissive CORS layer
+/// stamps `access-control-allow-origin: *` on responses. Infra-free (health
+/// never touches the pool).
+#[tokio::test]
+async fn health_ok_body_and_cors_header() {
+    let secret = "test-secret-minimum-32-characters-long-aaaaaaaaaa";
+    let pool = PgPool::connect_lazy(DEFAULT_DB).expect("lazy pool");
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(4);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("health");
+    assert_eq!(resp.status(), StatusCode::OK, "health status");
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .and_then(|h| h.to_str().ok()),
+        Some("*"),
+        "permissive CORS header missing"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(&bytes[..], b"ok", "health body");
+}
+
+/// A repository/DB failure surfaces as HTTP 500 (`ApiError::Database`). Drives a
+/// pool pointed at a dead port with a short acquire timeout, so a valid-token
+/// read past auth fails at the query and maps to `INTERNAL_SERVER_ERROR`.
+#[tokio::test]
+async fn db_error_maps_to_500() {
+    let secret = "test-secret-minimum-32-characters-long-aaaaaaaaaa";
+    // Lazy pool at a closed port; first query fails fast (connection refused).
+    let pool = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(2))
+        .connect_lazy("postgresql://nobody@127.0.0.1:1/nodb")
+        .expect("lazy pool");
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(4);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_secs();
+    let token = mint_jwt_with_exp(Uuid::new_v4(), secret, now + 3600);
+
+    // Valid token passes auth; the handler then hits the dead DB → 500.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/api/v1/meters/stats", &token, None))
+        .await
+        .expect("stats");
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "DB failure should be 500, got {}",
+        resp.status()
+    );
 }
 
 /// Remove the meter + readings this test created. Never touches the user.
