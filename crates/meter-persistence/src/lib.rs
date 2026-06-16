@@ -2,10 +2,7 @@
 //!
 //! Concrete SQLx/PostgreSQL implementations of the `meter-core` traits.
 
-/// Non-database infrastructure adapters (mint gateway).
-pub mod infra;
 /// SQLx-based PostgreSQL repositories.
 pub mod repository;
 
-pub use infra::{DisabledMintGateway, NatsMintGateway};
 pub use repository::MeterRepository;

@@ -5,60 +5,76 @@ right spot instead of guessing. Test-first rule (root `CLAUDE.md`) applies: run 
 narrowest test covering your change, widen if needed, report the real result.
 
 > SQLx is runtime-checked here — unit tests need **no `DATABASE_URL`, no `.sqlx` cache**.
-> Integration tests need live infra and are `#[ignore]` by default.
+> This service has no NATS / blockchain / Solana dependency. Unit tests are pure; there
+> is also **one DB-gated HTTP e2e test** (`#[ignore]` by default — see below).
 
 ## Quick
 
 ```bash
 cargo check                  # compile only, fast feedback
-cargo test                   # all unit tests (no infra needed)
+cargo test                   # all unit tests (the e2e test is #[ignore], skipped here)
 ```
 
 ## Unit tests — where they live
 
-### `meter-persistence` — mint id / window math (`src/infra/mint.rs`)
+### `meter-logic` — business rules (`src/meter_service.rs`, fake repo)
 
-| Critical point | Why it matters | Command |
-| --- | --- | --- |
-| 15-min window floor | mint idempotency key `mint:{serial}:{window_start_ms}` + on-chain `(meter_id, window_start_ms)` PDA must be stable per (meter, window) and match the aggregator billing window (`WINDOW_MS`) | `cargo test -p meter-persistence window_floors_to_15_min -- --nocapture` |
-| UUID serial → meter_id bytes | a UUID serial maps to its own 16 bytes | `cargo test -p meter-persistence meter_id_uses_uuid_bytes_when_serial_is_uuid` |
-| non-UUID serial → stable v5 id | non-UUID serial maps to a stable, collision-distinct id | `cargo test -p meter-persistence meter_id_falls_back_to_stable_v5_for_non_uuid` |
-| all mint-id / window logic | run the whole crate after touching `mint.rs` | `cargo test -p meter-persistence` |
-
-### `meter-logic` — business rules (`src/meter_service.rs`, fake repo + mint)
-
-Pure, mock-free layer — no DB/NATS. `cargo test -p meter-logic` runs all of these.
+Pure, mock-free layer — no DB. `cargo test -p meter-logic` runs all of these.
 
 | Critical point | What's asserted | Test |
 | --- | --- | --- |
 | page clamp | `limit` clamps to `1..=500`, negative `offset` → 0 | `list_readings_clamps_to_500_1_and_0` |
-| register validation | blank serial → `BadRequest`; serial stored trimmed (else NATS readings drop) | `register_meter_rejects_empty_serial`, `register_meter_persists_trimmed_serial` |
-| kWh validation | negative / non-finite kWh → `BadRequest` (both paths) | `submit_rejects_negative_kwh`, `submit_rejects_non_finite_kwh`, `ingest_rejects_negative_kwh` |
-| meter ownership | unknown serial → `NotFound`; unregistered device serial → `NotFound` | `submit_unknown_meter_is_not_found`, `ingest_unregistered_serial_is_not_found` |
+| register validation | blank serial → `BadRequest`; serial stored trimmed | `register_meter_rejects_empty_serial`, `register_meter_persists_trimmed_serial` |
+| kWh validation | negative / non-finite kWh → `BadRequest` | `submit_rejects_negative_kwh`, `submit_rejects_non_finite_kwh` |
+| meter ownership | unknown serial → `NotFound` | `submit_unknown_meter_is_not_found` |
 | serial normalization | submit trims the path serial before lookup/persist (symmetry with registration) | `submit_trims_path_serial_before_persisting` |
 | wallet fallback | blank request wallet → owner wallet; present → request wallet; none anywhere → `BadRequest` | `submit_falls_back_to_owner_wallet_when_request_blank`, `submit_uses_request_wallet_when_present`, `submit_rejects_when_no_wallet_anywhere` |
-| device wallet trust | device path credits the **owner's** wallet, never an off-wire value | `ingest_credits_owner_wallet_not_wire_value` |
-| mint best-effort | reading persisted even when mint fails; success marks minted + signature | `submit_auto_mint_failure_still_persists_reading`, `submit_with_auto_mint_marks_minted`, `submit_without_auto_mint_persists_unminted` |
-| idempotent ingest | mint `Unavailable` → `false` (deferred); already-minted redelivery → `true` | `ingest_mint_unavailable_defers_but_succeeds`, `ingest_already_minted_is_idempotent_success` |
-| mint guards | already minted → `Conflict`; empty wallet → `BadRequest` | `mint_existing_already_minted_conflicts`, `mint_existing_rejects_empty_wallet` |
 
-## Integration tests — live infra, `#[ignore]`
+### `meter-api` — realtime SSE filter (`src/handlers/meter.rs`)
 
-In `bin/meter-service/tests/`. Package: `gridtokenx-meter-service`.
+`cargo test -p meter-api` runs these.
 
-| Test | Verifies | Needs |
+| Critical point | What's asserted | Test |
 | --- | --- | --- |
-| `mint_e2e::mint_path_writes_onchain_tracking_columns` | mint path persists reading then writes `blockchain_*` tracking columns | Postgres + NATS + registered serial (fake Chain Bridge responder) |
-| `mint_onchain_e2e::real_onchain_mint_writes_tracking_columns` | REAL on-chain mint writes tracking columns | Postgres + NATS + live Chain Bridge + Solana validator (`./scripts/app.sh init` first) |
+| SSE per-user filter | a reading for the owning user produces an event | `sse_event_emitted_for_owning_user` |
+| SSE isolation | another user's reading is filtered out (`None`) | `sse_event_filtered_for_other_user` |
+
+### `meter-persistence` — mint-status projection (`src/repository/meter.rs`)
+
+`mint_status` is **derived read-only in SQL** from the shared table's dormant blockchain
+columns (`MINT_STATUS_CASE`): `minted` → `"minted"`, `blockchain_status='failed'` /
+`blockchain_last_error IS NOT NULL` → `"denied"`, else `"pending"`. `user_stats` exposes the
+same predicates as `minted_count` / `pending_count` / `denied_count`. Pure-SQL, so it is **not**
+unit-testable without a DB — covered by the e2e test below.
+
+## HTTP e2e test (DB-gated, `#[ignore]`)
+
+`bin/meter-service/tests/e2e_http.rs` drives the **real router in-process** (via
+`tower::ServiceExt::oneshot`, no socket) against live Postgres: register → submit → SSE →
+list → stats. Proves `mint_status` flows through every read path, including the realtime
+stream. Self-contained — borrows an existing wallet-bearing user, uses a throwaway serial,
+deletes the meter + readings it creates.
 
 ```bash
-# Stage 2B/3 — fake Chain Bridge over NATS, no Solana/Vault:
 DATABASE_URL=postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx \
-NATS_URL=nats://127.0.0.1:9020 TEST_METER_SERIAL=<registered-serial> \
-cargo test -p gridtokenx-meter-service --test mint_e2e -- --ignored --nocapture
+JWT_SECRET=dev-jwt-secret-key-minimum-32-characters-long-for-development-2025 \
+cargo test -p gridtokenx-meter-service --test e2e_http -- --ignored --nocapture
+```
 
-# Stage 2C — real on-chain mint:
-DATABASE_URL=postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx \
-NATS_URL=nats://127.0.0.1:9020 TEST_METER_SERIAL=<registered-serial> \
-cargo test -p gridtokenx-meter-service --test mint_onchain_e2e -- --ignored --nocapture
+> `minted` / `pending` are exercised by whatever live data exists; the `denied` branch needs a
+> reading with `blockchain_status='failed'` (none in normal flow) — inject one to prove it.
+
+## Manual / runtime check (realtime stream)
+
+The e2e test above covers SSE end-to-end. For an ad-hoc live smoke-test of a running service:
+
+```bash
+# Terminal 1 — subscribe to the stream
+curl -N -H "Authorization: Bearer <jwt>" \
+  http://localhost:8080/api/v1/meters/readings/stream
+
+# Terminal 2 — submit a reading for the same user's meter; it should appear in terminal 1
+curl -X POST -H "Authorization: Bearer <jwt>" -H 'content-type: application/json' \
+  -d '{"kwh": 1.5}' \
+  http://localhost:8080/api/v1/meters/<serial>/readings
 ```

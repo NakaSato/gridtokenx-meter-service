@@ -10,4 +10,4 @@ pub mod middleware;
 /// Shared application state (DI container).
 pub mod state;
 
-pub use state::AppState;
+pub use state::{AppState, ReadingEvent};

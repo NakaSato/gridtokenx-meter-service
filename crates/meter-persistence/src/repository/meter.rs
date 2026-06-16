@@ -5,13 +5,21 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use meter_core::domain::meter::{
-    Meter, MeterReading, MeterStats, ReadingMintInfo, ReadingOwner, RegisterMeterRequest,
-};
+use meter_core::domain::meter::{Meter, MeterReading, MeterStats, RegisterMeterRequest};
 use meter_core::error::{ApiError, Result};
 use meter_core::traits::MeterRepositoryTrait;
 
 const TS_FMT: &str = r#"YYYY-MM-DD"T"HH24:MI:SS.MS"Z""#;
+
+/// Read-only derivation of a reading's token-mint status from the shared
+/// table's dormant blockchain columns. This service never writes these columns
+/// (other services / history do); it only projects them for the dashboard.
+/// Order matters: minted wins over denied wins over pending.
+const MINT_STATUS_CASE: &str = "CASE
+    WHEN COALESCE(minted, false) OR COALESCE(on_chain_confirmed, false) THEN 'minted'
+    WHEN blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL THEN 'denied'
+    ELSE 'pending'
+ END";
 
 /// Projection for a [`Meter`] row, joined to its owner for the wallet address.
 fn meter_select(filter: &str) -> String {
@@ -37,12 +45,12 @@ fn reading_select(filter: &str) -> String {
                 COALESCE(kwh_amount, 0)::float8                     AS kwh,
                 to_char(timestamp  AT TIME ZONE 'UTC', '{TS_FMT}')  AS timestamp,
                 to_char(created_at AT TIME ZONE 'UTC', '{TS_FMT}')  AS submitted_at,
-                COALESCE(minted, false)                             AS minted,
-                mint_tx_signature                                   AS tx_signature,
                 energy_generated::float8                            AS energy_generated,
                 energy_consumed::float8                             AS energy_consumed,
                 voltage::float8                                     AS voltage,
-                current::float8                                     AS current
+                current::float8                                     AS current,
+                {MINT_STATUS_CASE}                                  AS mint_status,
+                mint_tx_signature                                   AS mint_tx_signature
          FROM meter_readings
          WHERE {filter}"
     )
@@ -102,10 +110,10 @@ impl MeterRepositoryTrait for MeterRepository {
                 COALESCE(SUM(energy_generated), 0)::float8                                 AS total_produced,
                 COALESCE(SUM(energy_consumed), 0)::float8                                  AS total_consumed,
                 to_char(MAX(timestamp) AT TIME ZONE 'UTC', '{TS_FMT}')                     AS last_reading_time,
-                COALESCE(SUM(CASE WHEN minted THEN kwh_amount ELSE 0 END), 0)::float8      AS total_minted,
-                COUNT(*) FILTER (WHERE minted)                                             AS total_minted_count,
-                COALESCE(SUM(CASE WHEN NOT minted THEN kwh_amount ELSE 0 END), 0)::float8  AS pending_mint,
-                COUNT(*) FILTER (WHERE NOT minted)                                         AS pending_mint_count
+                COUNT(*) FILTER (WHERE COALESCE(minted, false) OR COALESCE(on_chain_confirmed, false))::int8                         AS minted_count,
+                COUNT(*) FILTER (WHERE blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL)::int8                       AS denied_count,
+                COUNT(*) FILTER (WHERE NOT (COALESCE(minted, false) OR COALESCE(on_chain_confirmed, false))
+                                   AND NOT (blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL))::int8               AS pending_count
              FROM meter_readings
              WHERE user_id = $1"
         );
@@ -168,64 +176,6 @@ impl MeterRepositoryTrait for MeterRepository {
         Ok(meter)
     }
 
-    async fn find_owner_by_serial(&self, serial: &str) -> Result<Option<ReadingOwner>> {
-        let owner = sqlx::query_as::<_, ReadingOwner>(
-            "SELECT m.user_id                        AS user_id,
-                    COALESCE(u.wallet_address, '')    AS wallet_address
-             FROM meters m
-             JOIN users u ON u.id = m.user_id
-             WHERE m.serial_number = $1",
-        )
-        .bind(serial)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(owner)
-    }
-
-    async fn insert_device_reading(
-        &self,
-        reading_id: Uuid,
-        user_id: Uuid,
-        meter_serial: &str,
-        kwh: f64,
-        wallet_address: &str,
-        timestamp_ms: i64,
-    ) -> Result<bool> {
-        // meter_readings is partitioned with a composite PK (id, reading_timestamp),
-        // so `ON CONFLICT (id)` is unusable. Dedupe with an existence check on the
-        // reading id: the consumer drains messages serially, so this is race-free
-        // for a single instance, and the mint `minted` guard is the backstop
-        // against any double on-chain mint.
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM meter_readings WHERE id = $1)")
-                .bind(reading_id)
-                .fetch_one(&self.pool)
-                .await?;
-        if exists {
-            return Ok(false);
-        }
-
-        sqlx::query(
-            "INSERT INTO meter_readings
-                (id, user_id, wallet_address, meter_serial, kwh_amount,
-                 timestamp, energy_generated, minted)
-             VALUES
-                ($1, $2, $3, $4, $5,
-                 to_timestamp($6::float8 / 1000.0), $5, false)",
-        )
-        .bind(reading_id)
-        .bind(user_id)
-        .bind(wallet_address)
-        .bind(meter_serial)
-        .bind(kwh)
-        .bind(timestamp_ms)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(true)
-    }
-
     async fn insert_reading(
         &self,
         user_id: Uuid,
@@ -257,60 +207,5 @@ impl MeterRepositoryTrait for MeterRepository {
             .await?;
 
         Ok(reading)
-    }
-
-    async fn get_reading_for_mint(
-        &self,
-        user_id: Uuid,
-        reading_id: Uuid,
-    ) -> Result<Option<ReadingMintInfo>> {
-        let info = sqlx::query_as::<_, ReadingMintInfo>(
-            "SELECT id,
-                    COALESCE(meter_serial, '')                 AS meter_serial,
-                    COALESCE(wallet_address, '')               AS wallet_address,
-                    COALESCE(kwh_amount, 0)::float8            AS kwh,
-                    (EXTRACT(EPOCH FROM timestamp) * 1000)::int8 AS timestamp_ms,
-                    COALESCE(minted, false)                    AS minted
-             FROM meter_readings
-             WHERE id = $1 AND user_id = $2",
-        )
-        .bind(reading_id)
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(info)
-    }
-
-    async fn mark_reading_minted(
-        &self,
-        reading_id: Uuid,
-        signature: &str,
-        slot: u64,
-    ) -> Result<()> {
-        // Slot is a u64 on-chain but the column is int8; clamp the (impossible)
-        // overflow rather than wrapping negative.
-        let slot_i64 = i64::try_from(slot).unwrap_or(i64::MAX);
-        // Records the SUBMITTED mint (we have a signature + slot from the bridge).
-        // A BEFORE UPDATE trigger sets blockchain_status='submitted' and
-        // blockchain_submitted_at on the first tx-signature write, so we do not set
-        // them here. Finality (blockchain_status='confirmed', on_chain_confirmed,
-        // on_chain_confirmed_at) is left to a separate chain confirmer.
-        sqlx::query(
-            "UPDATE meter_readings
-             SET minted = true,
-                 mint_tx_signature = $2,
-                 blockchain_tx_signature = $2,
-                 on_chain_slot = $3,
-                 updated_at = now()
-             WHERE id = $1",
-        )
-        .bind(reading_id)
-        .bind(signature)
-        .bind(slot_i64)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
     }
 }

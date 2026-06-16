@@ -9,4 +9,4 @@ pub mod error;
 pub mod traits;
 
 pub use error::{ApiError, Result};
-pub use traits::{MeterRepositoryTrait, MintGateway};
+pub use traits::MeterRepositoryTrait;

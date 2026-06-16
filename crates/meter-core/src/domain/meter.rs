@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// UI `MeterResponse`.
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Meter {
     /// Meter primary key.
     pub id: Uuid,
@@ -26,8 +26,8 @@ pub struct Meter {
     pub zone_id: Option<i32>,
 }
 
-/// UI `MeterReading`.
-#[derive(Debug, Serialize, sqlx::FromRow)]
+/// UI `MeterReading`. `Clone` so it can be fanned out to realtime SSE subscribers.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct MeterReading {
     /// Reading primary key.
     pub id: Uuid,
@@ -39,15 +39,6 @@ pub struct MeterReading {
     pub timestamp: String,
     /// Time the reading was persisted (RFC-3339 UTC).
     pub submitted_at: String,
-    /// Whether the reading has been minted on-chain.
-    pub minted: bool,
-    /// Mint transaction signature, if minted.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_signature: Option<String>,
-    /// Optional status message (e.g. set after an auto-mint).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[sqlx(default)]
-    pub message: Option<String>,
     /// Energy generated this interval.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub energy_generated: Option<f64>,
@@ -60,10 +51,17 @@ pub struct MeterReading {
     /// Measured current.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<f64>,
+    /// Token-mint status, derived read-only from the shared table's dormant
+    /// blockchain columns: `"minted"` (settled on-chain), `"denied"` (mint
+    /// failed), or `"pending"` (not yet minted). This service never writes it.
+    pub mint_status: String,
+    /// On-chain mint transaction signature, when `mint_status == "minted"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mint_tx_signature: Option<String>,
 }
 
 /// UI `MeterStats`.
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct MeterStats {
     /// Total energy produced across all readings.
     pub total_produced: f64,
@@ -71,14 +69,12 @@ pub struct MeterStats {
     pub total_consumed: f64,
     /// Timestamp of the most recent reading (RFC-3339 UTC).
     pub last_reading_time: Option<String>,
-    /// Total kWh minted.
-    pub total_minted: f64,
-    /// Count of minted readings.
-    pub total_minted_count: i64,
-    /// Total kWh awaiting mint.
-    pub pending_mint: f64,
-    /// Count of readings awaiting mint.
-    pub pending_mint_count: i64,
+    /// Readings whose tokens are minted on-chain.
+    pub minted_count: i64,
+    /// Readings not yet minted.
+    pub pending_count: i64,
+    /// Readings whose mint failed.
+    pub denied_count: i64,
 }
 
 /// UI `registerMeter` request body (`POST /api/v1/meters`).
@@ -117,58 +113,4 @@ pub struct SubmitReadingRequest {
     pub wallet_address: Option<String>,
     /// Reading timestamp (RFC-3339); defaults to now when omitted.
     pub timestamp: Option<String>,
-}
-
-/// UI `mintReading` response (`POST /api/v1/meters/readings/{id}/mint`).
-#[derive(Debug, Serialize)]
-pub struct MintResponse {
-    /// Human-readable status message.
-    pub message: String,
-    /// On-chain transaction signature of the mint.
-    pub transaction_signature: String,
-    /// Minted amount in kWh (string, mirroring the UI contract).
-    pub kwh_amount: String,
-    /// Wallet credited by the mint.
-    pub wallet_address: String,
-}
-
-/// Result of a successful on-chain mint, returned by the [`MintGateway`].
-///
-/// [`MintGateway`]: crate::traits::MintGateway
-#[derive(Debug, Clone)]
-pub struct MintOutcome {
-    /// On-chain transaction signature.
-    pub signature: String,
-    /// Slot the mint transaction landed in.
-    pub slot: u64,
-}
-
-/// Owner identity for a meter, resolved by serial number across all users.
-///
-/// Used by the device-ingest path (NATS forward from the aggregator bridge),
-/// which carries no authenticated user — readings are attributed to the
-/// registered owner of the meter serial.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct ReadingOwner {
-    /// Owning user id.
-    pub user_id: Uuid,
-    /// Owner's registered wallet address (may be empty if the owner has none).
-    pub wallet_address: String,
-}
-
-/// Fields needed to mint a stored reading on-chain.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct ReadingMintInfo {
-    /// Reading primary key.
-    pub id: Uuid,
-    /// Serial of the meter this reading belongs to.
-    pub meter_serial: String,
-    /// Wallet to credit.
-    pub wallet_address: String,
-    /// Energy in kWh.
-    pub kwh: f64,
-    /// Reading timestamp as epoch milliseconds.
-    pub timestamp_ms: i64,
-    /// Whether the reading has already been minted.
-    pub minted: bool,
 }
