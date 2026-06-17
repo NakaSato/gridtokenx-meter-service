@@ -1,4 +1,4 @@
-//! Library for the GridTokenX meter service.
+//! Library for the `GridTokenX` meter service.
 //!
 //! Holds the startup wiring and telemetry init for the meter-service binary.
 

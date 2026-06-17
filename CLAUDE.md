@@ -53,6 +53,18 @@ offline cache are needed to compile or run unit tests** — the DB is only touch
 Lints are strict (workspace `Cargo.toml`): `unsafe_code = deny`, `clippy::pedantic = warn`,
 `clippy::unwrap_used = deny`, `missing_docs = warn`. Don't introduce `.unwrap()`.
 
+**CI gate** (`.github/workflows/ci.yml`, always-on, infra-free). Hard gates:
+`cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and
+`cargo test --workspace`. Keep all green — pedantic warnings and unformatted code **fail** the
+build (run `cargo fmt` before pushing). The `#[ignore]` DB-gated e2e suite is **not** run in CI (shared
+IAM-owned, partitioned schema); it runs against a live stack — see [TESTING.md](TESTING.md).
+
+Coverage at a glance: `meter-logic` unit tests (validation, page clamp, wallet fallback,
+serial norm, kWh `0.0` boundary), `meter-api` SSE-filter unit tests, two infra-free router
+tests (auth → 401, malformed → 400/404), and the DB-gated `e2e_http` suite (all three
+`mint_status` branches incl. synthetic minted/denied injection, cross-user authz, isolation,
+pagination, aggregates). See [TESTING.md](TESTING.md) for the per-test map.
+
 ---
 
 ## Architecture — layered, trait-DI ("sync-ish core, async edges")
@@ -101,6 +113,14 @@ Domain field names mirror the trading UI contract (`types/meter.ts`) — keep th
   `user_stats` exposes the same predicates as `minted_count`/`pending_count`/`denied_count`. The
   realtime `submit → SSE` path always emits `"pending"` (the row is freshly inserted unminted);
   later mint transitions are **not** pushed (no consumer) — clients re-fetch list/stats.
+- **No SSE push for mint/deny transitions — by design (won't-do).** This service does no
+  blockchain work and runs no consumer of mint/deny events; the columns flip out-of-band in
+  Postgres (written by other services), with no NATS/trigger/poll feeding back here. So a
+  reading's `mint_status` changing `pending → minted`/`denied` is **never** broadcast on the SSE
+  stream. The dashboard reconciles by re-fetching list/stats (it already polls every 30s, see the
+  trading UI `useSmartMeter`). Adding a live push would require a new event source (DB
+  `LISTEN/NOTIFY`, a NATS consumer, or a poll-and-diff loop) and is intentionally out of scope —
+  revisit only if near-real-time mint feedback becomes a product requirement.
 
 ---
 

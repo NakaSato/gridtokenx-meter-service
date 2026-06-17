@@ -68,8 +68,8 @@ pub async fn get_meter_stats(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Json<MeterStats>> {
-    let stats = state.meter_service.my_stats(user.user_id).await?;
-    Ok(Json(stats))
+    let meter_stats = state.meter_service.my_stats(user.user_id).await?;
+    Ok(Json(meter_stats))
 }
 
 /// POST /api/v1/meters — register a meter for the authenticated user.
@@ -81,7 +81,10 @@ pub async fn register_meter(
     user: AuthUser,
     Json(req): Json<RegisterMeterRequest>,
 ) -> Result<Json<RegisterMeterResponse>> {
-    let resp = state.meter_service.register_meter(user.user_id, &req).await?;
+    let resp = state
+        .meter_service
+        .register_meter(user.user_id, &req)
+        .await?;
     Ok(Json(resp))
 }
 
@@ -118,13 +121,18 @@ pub async fn submit_reading(
 /// Subscribes to the broadcast channel and emits the authenticated user's
 /// readings as `data:` events as they are submitted. Lagged events (slow
 /// client) are skipped rather than closing the stream.
+// Axum handler: kept `async` for handler-signature consistency (and so the
+// `AuthUser`/`State` extractors stay by-value) even though the body never awaits.
+#[allow(clippy::unused_async)]
 pub async fn stream_readings(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
     let user_id = user.user_id;
-    let stream = BroadcastStream::new(state.readings_tx.subscribe())
-        .filter_map(move |res| async move { res.ok().and_then(|ev| sse_event_for_user(&ev, user_id)) });
+    let stream =
+        BroadcastStream::new(state.readings_tx.subscribe()).filter_map(move |res| async move {
+            res.ok().and_then(|ev| sse_event_for_user(&ev, user_id))
+        });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
@@ -168,7 +176,10 @@ mod tests {
     #[test]
     fn sse_event_emitted_for_owning_user() {
         let user = Uuid::new_v4();
-        let ev = ReadingEvent { user_id: user, reading: reading() };
+        let ev = ReadingEvent {
+            user_id: user,
+            reading: reading(),
+        };
         assert!(sse_event_for_user(&ev, user).is_some());
     }
 
@@ -176,7 +187,10 @@ mod tests {
     fn sse_event_filtered_for_other_user() {
         let owner = Uuid::new_v4();
         let other = Uuid::new_v4();
-        let ev = ReadingEvent { user_id: owner, reading: reading() };
+        let ev = ReadingEvent {
+            user_id: owner,
+            reading: reading(),
+        };
         assert!(sse_event_for_user(&ev, other).is_none());
     }
 }

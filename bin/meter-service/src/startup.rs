@@ -27,6 +27,10 @@ use meter_persistence::MeterRepository;
 const READINGS_CHANNEL_CAP: usize = 256;
 
 /// Connects dependencies and serves the meter service until the process exits.
+///
+/// # Errors
+/// Returns an error if the Postgres pool cannot be created or the TCP listener
+/// fails to bind / serve.
 pub async fn run(config: Config) -> anyhow::Result<()> {
     // 1. Database pool
     let pool = PgPoolOptions::new()
@@ -72,7 +76,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/v1/me/meters", get(meter::get_my_meters))
         .route("/api/v1/meters", post(meter::register_meter))
         .route("/api/v1/meters/readings", get(meter::get_my_readings))
-        .route("/api/v1/meters/readings/stream", get(meter::stream_readings))
+        .route(
+            "/api/v1/meters/readings/stream",
+            get(meter::stream_readings),
+        )
         .route("/api/v1/meters/stats", get(meter::get_meter_stats))
         .route(
             "/api/v1/meters/{serial}/readings",

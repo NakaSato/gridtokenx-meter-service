@@ -1,4 +1,4 @@
-//! PostgreSQL meter repository. Ownership is by `user_id` (meters.user_id → users.id).
+//! `PostgreSQL` meter repository. Ownership is by `user_id` (`meters.user_id` → users.id).
 //! Timestamps are rendered RFC-3339 in SQL so they map straight into `String`.
 
 use async_trait::async_trait;
@@ -126,11 +126,7 @@ impl MeterRepositoryTrait for MeterRepository {
         Ok(stats)
     }
 
-    async fn register_meter(
-        &self,
-        user_id: Uuid,
-        req: &RegisterMeterRequest,
-    ) -> Result<Meter> {
+    async fn register_meter(&self, user_id: Uuid, req: &RegisterMeterRequest) -> Result<Meter> {
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO meters (user_id, serial_number, meter_type, location, latitude, longitude)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -160,18 +156,13 @@ impl MeterRepositoryTrait for MeterRepository {
         Ok(meter)
     }
 
-    async fn find_meter_by_serial(
-        &self,
-        user_id: Uuid,
-        serial: &str,
-    ) -> Result<Option<Meter>> {
-        let meter = sqlx::query_as::<_, Meter>(&meter_select(
-            "m.user_id = $1 AND m.serial_number = $2",
-        ))
-        .bind(user_id)
-        .bind(serial)
-        .fetch_optional(&self.pool)
-        .await?;
+    async fn find_meter_by_serial(&self, user_id: Uuid, serial: &str) -> Result<Option<Meter>> {
+        let meter =
+            sqlx::query_as::<_, Meter>(&meter_select("m.user_id = $1 AND m.serial_number = $2"))
+                .bind(user_id)
+                .bind(serial)
+                .fetch_optional(&self.pool)
+                .await?;
 
         Ok(meter)
     }

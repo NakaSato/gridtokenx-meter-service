@@ -71,7 +71,9 @@ impl MeterService {
     ) -> Result<RegisterMeterResponse> {
         let serial = req.serial_number.trim();
         if serial.is_empty() {
-            return Err(ApiError::BadRequest("serial_number is required".to_string()));
+            return Err(ApiError::BadRequest(
+                "serial_number is required".to_string(),
+            ));
         }
         // Persist the canonical (trimmed) serial so a reading submitted with a
         // whitespace-padded serial still resolves the meter by exact equality.
@@ -103,7 +105,9 @@ impl MeterService {
         req: &SubmitReadingRequest,
     ) -> Result<MeterReading> {
         if req.kwh < 0.0 || !req.kwh.is_finite() {
-            return Err(ApiError::BadRequest("kwh must be a non-negative number".to_string()));
+            return Err(ApiError::BadRequest(
+                "kwh must be a non-negative number".to_string(),
+            ));
         }
 
         // Match registration, which stores the trimmed serial: trim the path
@@ -264,7 +268,10 @@ mod tests {
         let repo = Arc::new(FakeRepo::default());
         let svc = MeterService::new(repo.clone());
 
-        let _ = svc.list_my_readings(Uuid::nil(), 10_000, -5).await.expect("ok");
+        let _ = svc
+            .list_my_readings(Uuid::nil(), 10_000, -5)
+            .await
+            .expect("ok");
         assert_eq!(*repo.readings_page.lock().expect("lock"), Some((500, 0)));
 
         let _ = svc.list_my_readings(Uuid::nil(), 0, 7).await.expect("ok");
@@ -283,7 +290,10 @@ mod tests {
             latitude: None,
             longitude: None,
         };
-        let err = svc.register_meter(Uuid::nil(), &req).await.expect_err("should reject");
+        let err = svc
+            .register_meter(Uuid::nil(), &req)
+            .await
+            .expect_err("should reject");
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
@@ -299,7 +309,10 @@ mod tests {
             longitude: None,
         };
         let resp = svc.register_meter(Uuid::nil(), &req).await.expect("ok");
-        assert_eq!(*repo.registered_serial.lock().expect("lock"), Some("M-9".to_string()));
+        assert_eq!(
+            *repo.registered_serial.lock().expect("lock"),
+            Some("M-9".to_string())
+        );
         assert_eq!(resp.meter.expect("meter").serial_number, "M-9");
     }
 
@@ -307,7 +320,10 @@ mod tests {
 
     #[tokio::test]
     async fn submit_rejects_negative_kwh() {
-        let svc = service(FakeRepo { meter_wallet: Some(OWNER_WALLET.to_string()), ..Default::default() });
+        let svc = service(FakeRepo {
+            meter_wallet: Some(OWNER_WALLET.to_string()),
+            ..Default::default()
+        });
         let err = svc
             .submit_reading(Uuid::nil(), "M1", &submit_req(-1.0, None))
             .await
@@ -317,7 +333,10 @@ mod tests {
 
     #[tokio::test]
     async fn submit_rejects_non_finite_kwh() {
-        let svc = service(FakeRepo { meter_wallet: Some(OWNER_WALLET.to_string()), ..Default::default() });
+        let svc = service(FakeRepo {
+            meter_wallet: Some(OWNER_WALLET.to_string()),
+            ..Default::default()
+        });
         let err = svc
             .submit_reading(Uuid::nil(), "M1", &submit_req(f64::NAN, None))
             .await
@@ -325,11 +344,32 @@ mod tests {
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
+    #[tokio::test]
+    async fn submit_accepts_zero_kwh_boundary() {
+        // Validation rejects `kwh < 0.0`, so exactly 0.0 is the accepted lower
+        // bound — a zero reading persists rather than 400s.
+        let repo = Arc::new(FakeRepo {
+            meter_wallet: Some(OWNER_WALLET.to_string()),
+            ..Default::default()
+        });
+        let svc = MeterService::new(repo.clone());
+        svc.submit_reading(Uuid::nil(), "M1", &submit_req(0.0, None))
+            .await
+            .expect("zero kwh should be accepted");
+        assert_eq!(
+            *repo.inserted_serial.lock().expect("lock"),
+            Some("M1".to_string())
+        );
+    }
+
     // --- submit_reading: meter lookup --------------------------------------
 
     #[tokio::test]
     async fn submit_unknown_meter_is_not_found() {
-        let svc = service(FakeRepo { meter_wallet: None, ..Default::default() });
+        let svc = service(FakeRepo {
+            meter_wallet: None,
+            ..Default::default()
+        });
         let err = svc
             .submit_reading(Uuid::nil(), "M1", &submit_req(1.0, None))
             .await
@@ -341,37 +381,58 @@ mod tests {
 
     #[tokio::test]
     async fn submit_falls_back_to_owner_wallet_when_request_blank() {
-        let repo = Arc::new(FakeRepo { meter_wallet: Some(OWNER_WALLET.to_string()), ..Default::default() });
+        let repo = Arc::new(FakeRepo {
+            meter_wallet: Some(OWNER_WALLET.to_string()),
+            ..Default::default()
+        });
         let svc = MeterService::new(repo.clone());
         svc.submit_reading(Uuid::nil(), "M1", &submit_req(1.0, Some("  ")))
             .await
             .expect("ok");
-        assert_eq!(*repo.inserted_wallet.lock().expect("lock"), Some(OWNER_WALLET.to_string()));
+        assert_eq!(
+            *repo.inserted_wallet.lock().expect("lock"),
+            Some(OWNER_WALLET.to_string())
+        );
     }
 
     #[tokio::test]
     async fn submit_trims_path_serial_before_persisting() {
-        let repo = Arc::new(FakeRepo { meter_wallet: Some(OWNER_WALLET.to_string()), ..Default::default() });
+        let repo = Arc::new(FakeRepo {
+            meter_wallet: Some(OWNER_WALLET.to_string()),
+            ..Default::default()
+        });
         let svc = MeterService::new(repo.clone());
         svc.submit_reading(Uuid::nil(), "  M-9  ", &submit_req(1.0, None))
             .await
             .expect("ok");
-        assert_eq!(*repo.inserted_serial.lock().expect("lock"), Some("M-9".to_string()));
+        assert_eq!(
+            *repo.inserted_serial.lock().expect("lock"),
+            Some("M-9".to_string())
+        );
     }
 
     #[tokio::test]
     async fn submit_uses_request_wallet_when_present() {
-        let repo = Arc::new(FakeRepo { meter_wallet: Some(OWNER_WALLET.to_string()), ..Default::default() });
+        let repo = Arc::new(FakeRepo {
+            meter_wallet: Some(OWNER_WALLET.to_string()),
+            ..Default::default()
+        });
         let svc = MeterService::new(repo.clone());
         svc.submit_reading(Uuid::nil(), "M1", &submit_req(1.0, Some("req-wallet")))
             .await
             .expect("ok");
-        assert_eq!(*repo.inserted_wallet.lock().expect("lock"), Some("req-wallet".to_string()));
+        assert_eq!(
+            *repo.inserted_wallet.lock().expect("lock"),
+            Some("req-wallet".to_string())
+        );
     }
 
     #[tokio::test]
     async fn submit_rejects_when_no_wallet_anywhere() {
-        let svc = service(FakeRepo { meter_wallet: Some(String::new()), ..Default::default() });
+        let svc = service(FakeRepo {
+            meter_wallet: Some(String::new()),
+            ..Default::default()
+        });
         let err = svc
             .submit_reading(Uuid::nil(), "M1", &submit_req(1.0, None))
             .await

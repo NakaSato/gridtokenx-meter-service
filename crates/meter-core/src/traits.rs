@@ -27,18 +27,10 @@ pub trait MeterRepositoryTrait: Send + Sync {
     async fn user_stats(&self, user_id: Uuid) -> Result<MeterStats>;
 
     /// Registers a new meter for the user and returns the stored row.
-    async fn register_meter(
-        &self,
-        user_id: Uuid,
-        req: &RegisterMeterRequest,
-    ) -> Result<Meter>;
+    async fn register_meter(&self, user_id: Uuid, req: &RegisterMeterRequest) -> Result<Meter>;
 
     /// Looks up one of the user's meters by serial number.
-    async fn find_meter_by_serial(
-        &self,
-        user_id: Uuid,
-        serial: &str,
-    ) -> Result<Option<Meter>>;
+    async fn find_meter_by_serial(&self, user_id: Uuid, serial: &str) -> Result<Option<Meter>>;
 
     /// Inserts a reading for the user and returns the stored row.
     async fn insert_reading(

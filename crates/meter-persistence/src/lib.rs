@@ -2,7 +2,7 @@
 //!
 //! Concrete SQLx/PostgreSQL implementations of the `meter-core` traits.
 
-/// SQLx-based PostgreSQL repositories.
+/// SQLx-based `PostgreSQL` repositories.
 pub mod repository;
 
 pub use repository::MeterRepository;
