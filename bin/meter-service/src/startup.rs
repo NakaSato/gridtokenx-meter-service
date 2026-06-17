@@ -48,6 +48,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // 3. Realtime readings broadcast channel (submit → SSE subscribers).
     let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(READINGS_CHANNEL_CAP);
 
+    // 3a. Mint-status poller: pushes pending→minted/denied transitions onto the
+    //     same channel (the mint columns are written out-of-band by other
+    //     services). Disabled when `mint_poll_secs == 0`.
+    crate::mint_poller::spawn(
+        meter_service.clone(),
+        readings_tx.clone(),
+        config.mint_poll_secs,
+    );
+
     let state = AppState {
         meter_service,
         jwt_secret: Arc::from(config.jwt_secret.as_str()),
@@ -73,6 +82,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(system::health))
+        .route("/health/ready", get(system::ready))
         .route("/api/v1/me/meters", get(meter::get_my_meters))
         .route("/api/v1/meters", post(meter::register_meter))
         .route("/api/v1/meters/readings", get(meter::get_my_readings))

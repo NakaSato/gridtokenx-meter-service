@@ -4,6 +4,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
 use futures::stream::{Stream, StreamExt};
@@ -46,18 +47,32 @@ fn default_limit() -> i64 {
 
 /// GET /api/v1/meters/readings?limit&offset
 ///
+/// The body stays a JSON array of readings (unchanged contract). Pagination
+/// metadata rides in response headers: `X-Total-Count` (total readings for the
+/// user) and `X-Has-More` (`true`/`false` — whether further pages exist).
+///
 /// # Errors
 /// Returns an error if the query fails.
 pub async fn get_my_readings(
     State(state): State<AppState>,
     user: AuthUser,
     Query(q): Query<ReadingsQuery>,
-) -> Result<Json<Vec<MeterReading>>> {
-    let readings = state
+) -> Result<(HeaderMap, Json<Vec<MeterReading>>)> {
+    let (readings, total, has_more) = state
         .meter_service
-        .list_my_readings(user.user_id, q.limit, q.offset)
+        .list_my_readings_page(user.user_id, q.limit, q.offset)
         .await?;
-    Ok(Json(readings))
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("x-total-count"),
+        HeaderValue::from(total),
+    );
+    headers.insert(
+        HeaderName::from_static("x-has-more"),
+        HeaderValue::from_static(if has_more { "true" } else { "false" }),
+    );
+    Ok((headers, Json(readings)))
 }
 
 /// GET /api/v1/meters/stats

@@ -1135,22 +1135,6 @@ async fn inject_reading(
     Ok(id.to_string())
 }
 
-/// GET stats, returning `(minted_count, denied_count)`.
-async fn stats_counts(app: &axum::Router, token: &str) -> Result<(i64, i64), String> {
-    let resp = app
-        .clone()
-        .oneshot(authed("GET", "/api/v1/meters/stats", token, None))
-        .await
-        .expect("stats");
-    if resp.status() != StatusCode::OK {
-        return Err(format!("stats status {}", resp.status()));
-    }
-    let s = json_body(resp).await;
-    let minted = s["minted_count"].as_i64().ok_or("minted_count not i64")?;
-    let denied = s["denied_count"].as_i64().ok_or("denied_count not i64")?;
-    Ok((minted, denied))
-}
-
 async fn run_mint_status(
     app: &axum::Router,
     pool: &PgPool,
@@ -1165,10 +1149,6 @@ async fn run_mint_status(
     }
 
     register(app, token, serial).await?;
-
-    // Baseline counts BEFORE injection; assert monotone +1 lower bounds after, so
-    // concurrent additions from other ignored tests / live services can't flake it.
-    let (base_minted, base_denied) = stats_counts(app, token).await?;
 
     let sig = format!("E2E_SIG_{}", Uuid::new_v4().simple());
     let id_minted =
@@ -1221,16 +1201,23 @@ async fn run_mint_status(
         "denied row should have no mint_tx_signature: {denied}"
     );
 
-    // Stats counters reflect both injected rows (lower bound: ≥ baseline + 1).
-    let (minted_count, denied_count) = stats_counts(app, token).await?;
-    check!(
-        minted_count > base_minted,
-        "minted_count did not rise: {minted_count} <= {base_minted}"
-    );
-    check!(
-        denied_count > base_denied,
-        "denied_count did not rise: {denied_count} <= {base_denied}"
-    );
+    // Counters scoped to THIS serial — exactly one minted + one denied — using
+    // the same predicates as `user_stats`. Serial-scoping keeps this
+    // deterministic under concurrent ignored tests that inject/clean their own
+    // mint rows for the shared user (a user-wide lower bound flakes when a
+    // concurrent cleanup deletes rows between snapshots).
+    let (minted_count, denied_count): (i64, i64) = sqlx::query_as(
+        "SELECT
+            COUNT(*) FILTER (WHERE COALESCE(minted, false) OR COALESCE(on_chain_confirmed, false))::int8,
+            COUNT(*) FILTER (WHERE blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL)::int8
+         FROM meter_readings WHERE meter_serial = $1",
+    )
+    .bind(serial)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("count query: {e}"))?;
+    check!(minted_count == 1, "serial minted_count {minted_count} != 1");
+    check!(denied_count == 1, "serial denied_count {denied_count} != 1");
 
     Ok(())
 }
@@ -1670,6 +1657,691 @@ async fn db_error_maps_to_500() {
         "DB failure should be 500, got {}",
         resp.status()
     );
+}
+
+/// Readiness: `GET /health/ready` returns 503 when Postgres is unreachable.
+/// No auth required; drives a lazy pool at a closed port so the ping fails fast.
+/// (The 200 path needs a live DB and is exercised by the DB-gated flow tests.)
+#[tokio::test]
+async fn ready_returns_503_when_db_unreachable() {
+    let secret = "test-secret-minimum-32-characters-long-aaaaaaaaaa";
+    let pool = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(2))
+        .connect_lazy("postgresql://nobody@127.0.0.1:1/nodb")
+        .expect("lazy pool");
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(4);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health/ready")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("ready");
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unreachable DB should be 503, got {}",
+        resp.status()
+    );
+}
+
+/// Readiness: `GET /health/ready` returns 200 against a live, reachable Postgres
+/// (the ping runs `SELECT 1`). DB-gated counterpart to the infra-free 503 test.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn ready_returns_200_when_db_reachable() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(4);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health/ready")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("ready");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "reachable DB should be 200, got {}",
+        resp.status()
+    );
+}
+
+/// Pagination metadata: `GET /readings` carries `X-Total-Count` (an integer) and
+/// `X-Has-More`. Register a meter, submit two readings, then request a 1-row page
+/// for a user that now has >= 2 readings → `X-Has-More: true`. Body stays an array.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn readings_headers_report_pagination() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query user");
+    let Some(user_id) = user_id else {
+        eprintln!("SKIP: no wallet-bearing user in DB");
+        return;
+    };
+
+    let token = mint_jwt(user_id, &secret);
+    let serial = format!("E2E-PAGEHDR-{}", Uuid::new_v4());
+
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let result = run_pagination_headers(&app, &token, &serial).await;
+    cleanup(&pool, &serial).await;
+    result.expect("pagination-headers flow");
+}
+
+async fn run_pagination_headers(
+    app: &axum::Router,
+    token: &str,
+    serial: &str,
+) -> Result<(), String> {
+    macro_rules! check {
+        ($cond:expr, $($arg:tt)*) => {
+            if !$cond { return Err(format!($($arg)*)); }
+        };
+    }
+
+    register(app, token, serial).await?;
+    submit(app, token, serial, 1.0).await?;
+    submit(app, token, serial, 2.0).await?;
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            "/api/v1/meters/readings?limit=1",
+            token,
+            None,
+        ))
+        .await
+        .expect("readings");
+    check!(
+        resp.status() == StatusCode::OK,
+        "readings status {}",
+        resp.status()
+    );
+
+    let total = resp
+        .headers()
+        .get("x-total-count")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok());
+    check!(
+        matches!(total, Some(t) if t >= 2),
+        "X-Total-Count missing/too small: {total:?}"
+    );
+    let has_more = resp
+        .headers()
+        .get("x-has-more")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    check!(
+        has_more.as_deref() == Some("true"),
+        "X-Has-More should be 'true' for a 1-row page: {has_more:?}"
+    );
+
+    // Body unchanged: still a JSON array, capped to the page size.
+    let list = json_body(resp).await;
+    let arr = list.as_array().cloned().unwrap_or_default();
+    check!(
+        arr.len() == 1,
+        "limit=1 should return 1 row, got {}",
+        arr.len()
+    );
+
+    Ok(())
+}
+
+/// Insert a reading row with arbitrary mint columns, returning its id. Richer
+/// than `inject_reading` — exercises the `on_chain_confirmed` /
+/// `blockchain_last_error` predicates and predicate precedence.
+async fn inject_mint_row(
+    pool: &PgPool,
+    user_id: Uuid,
+    serial: &str,
+    minted: bool,
+    on_chain_confirmed: bool,
+    blockchain_status: Option<&str>,
+    blockchain_last_error: Option<&str>,
+) -> Result<String, String> {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO meter_readings
+            (id, user_id, wallet_address, meter_serial, kwh_amount, timestamp,
+             minted, on_chain_confirmed, blockchain_status, blockchain_last_error)
+         VALUES
+            (gen_random_uuid(), $1, 'E2E-PRED', $2, 1.0, now(), $3, $4, $5, $6)
+         RETURNING id",
+    )
+    .bind(user_id)
+    .bind(serial)
+    .bind(minted)
+    .bind(on_chain_confirmed)
+    .bind(blockchain_status)
+    .bind(blockchain_last_error)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("inject mint row: {e}"))?;
+    Ok(id.to_string())
+}
+
+/// `MINT_STATUS_CASE` has four column predicates and an ordering (minted wins
+/// over denied wins over pending). Other tests only drive `minted` and
+/// `blockchain_status='failed'`; this covers the remaining `on_chain_confirmed`
+/// and `blockchain_last_error` predicates plus precedence.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn http_e2e_mint_status_alt_predicates_and_precedence() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query user");
+    let Some(user_id) = user_id else {
+        eprintln!("SKIP: no wallet-bearing user in DB");
+        return;
+    };
+
+    let token = mint_jwt(user_id, &secret);
+    let serial = format!("E2E-PRED-{}", Uuid::new_v4());
+
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let result = run_mint_predicates(&app, &pool, &token, &serial, user_id).await;
+    cleanup(&pool, &serial).await;
+    result.expect("mint-predicate flow");
+}
+
+async fn run_mint_predicates(
+    app: &axum::Router,
+    pool: &PgPool,
+    token: &str,
+    serial: &str,
+    user_id: Uuid,
+) -> Result<(), String> {
+    macro_rules! check {
+        ($cond:expr, $($arg:tt)*) => {
+            if !$cond { return Err(format!($($arg)*)); }
+        };
+    }
+
+    register(app, token, serial).await?;
+
+    // on_chain_confirmed alone (minted=false, no failure) → "minted".
+    let id_onchain = inject_mint_row(pool, user_id, serial, false, true, None, None).await?;
+    // blockchain_last_error set, status not 'failed' → "denied".
+    let id_error = inject_mint_row(
+        pool,
+        user_id,
+        serial,
+        false,
+        false,
+        None,
+        Some("rpc timeout"),
+    )
+    .await?;
+    // Precedence: minted=true AND blockchain_status='failed' → "minted" wins.
+    let id_both = inject_mint_row(pool, user_id, serial, true, false, Some("failed"), None).await?;
+    // Precedence: on_chain_confirmed=true AND last_error set → "minted" wins.
+    let id_both2 =
+        inject_mint_row(pool, user_id, serial, false, true, None, Some("late error")).await?;
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            "/api/v1/meters/readings?limit=200",
+            token,
+            None,
+        ))
+        .await
+        .expect("readings");
+    check!(
+        resp.status() == StatusCode::OK,
+        "readings status {}",
+        resp.status()
+    );
+    let list = json_body(resp).await;
+    let arr = list.as_array().cloned().unwrap_or_default();
+    let status_of = |id: &str| -> Option<String> {
+        arr.iter()
+            .find(|r| r["id"] == serde_json::json!(id))
+            .and_then(|r| r["mint_status"].as_str().map(str::to_string))
+    };
+
+    check!(
+        status_of(&id_onchain).as_deref() == Some("minted"),
+        "on_chain_confirmed not 'minted'"
+    );
+    check!(
+        status_of(&id_error).as_deref() == Some("denied"),
+        "blockchain_last_error not 'denied'"
+    );
+    check!(
+        status_of(&id_both).as_deref() == Some("minted"),
+        "precedence: minted+failed should be 'minted', got {:?}",
+        status_of(&id_both)
+    );
+    check!(
+        status_of(&id_both2).as_deref() == Some("minted"),
+        "precedence: on_chain+last_error should be 'minted', got {:?}",
+        status_of(&id_both2)
+    );
+
+    Ok(())
+}
+
+/// Insert a reading at an explicit `timestamp`, returning its id. Used to prove
+/// ordering and the `last_reading_time` aggregate deterministically.
+async fn inject_at(pool: &PgPool, user_id: Uuid, serial: &str, ts: &str) -> Result<String, String> {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO meter_readings
+            (id, user_id, wallet_address, meter_serial, kwh_amount, timestamp, minted)
+         VALUES
+            (gen_random_uuid(), $1, 'E2E-TS', $2, 1.0, $3::timestamptz, false)
+         RETURNING id",
+    )
+    .bind(user_id)
+    .bind(serial)
+    .bind(ts)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("inject_at: {e}"))?;
+    Ok(id.to_string())
+}
+
+/// Readings list is ordered newest-first (`ORDER BY timestamp DESC`), and the
+/// stats `last_reading_time` equals the user's MAX(timestamp). The newer row
+/// uses a far-future timestamp so it is also the deterministic global max.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn http_e2e_list_ordering_and_last_reading_time() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query user");
+    let Some(user_id) = user_id else {
+        eprintln!("SKIP: no wallet-bearing user in DB");
+        return;
+    };
+    let token = mint_jwt(user_id, &secret);
+    let serial = format!("E2E-ORD-{}", Uuid::new_v4());
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let result = run_ordering(&app, &pool, &token, &serial, user_id).await;
+    cleanup(&pool, &serial).await;
+    result.expect("ordering flow");
+}
+
+async fn run_ordering(
+    app: &axum::Router,
+    pool: &PgPool,
+    token: &str,
+    serial: &str,
+    user_id: Uuid,
+) -> Result<(), String> {
+    macro_rules! check {
+        ($cond:expr, $($arg:tt)*) => {
+            if !$cond { return Err(format!($($arg)*)); }
+        };
+    }
+    register(app, token, serial).await?;
+
+    let id_old = inject_at(pool, user_id, serial, "2030-01-01T00:00:00Z").await?;
+    let id_new = inject_at(pool, user_id, serial, "2099-12-31T23:59:59Z").await?;
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            "/api/v1/meters/readings?limit=200",
+            token,
+            None,
+        ))
+        .await
+        .expect("readings");
+    check!(
+        resp.status() == StatusCode::OK,
+        "readings status {}",
+        resp.status()
+    );
+    let list = json_body(resp).await;
+    let arr = list.as_array().cloned().unwrap_or_default();
+    let pos = |id: &str| arr.iter().position(|r| r["id"] == serde_json::json!(id));
+    let (p_old, p_new) = (pos(&id_old), pos(&id_new));
+    check!(
+        p_old.is_some() && p_new.is_some(),
+        "injected rows missing from list"
+    );
+    check!(
+        p_new < p_old,
+        "DESC order violated: newer at {p_new:?}, older at {p_old:?}"
+    );
+
+    // last_reading_time == the future max we injected.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/api/v1/meters/stats", token, None))
+        .await
+        .expect("stats");
+    check!(
+        resp.status() == StatusCode::OK,
+        "stats status {}",
+        resp.status()
+    );
+    let stats = json_body(resp).await;
+    let lrt = stats["last_reading_time"].as_str().unwrap_or_default();
+    check!(
+        lrt.starts_with("2099-12-31T23:59:59"),
+        "last_reading_time not the injected max: {lrt}"
+    );
+    Ok(())
+}
+
+/// A submitted reading's explicit `timestamp` is persisted (not overwritten by
+/// `now()`), surfaced back on the response.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn http_e2e_submit_explicit_timestamp() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query user");
+    let Some(user_id) = user_id else {
+        eprintln!("SKIP: no wallet-bearing user in DB");
+        return;
+    };
+    let token = mint_jwt(user_id, &secret);
+    let serial = format!("E2E-TS-{}", Uuid::new_v4());
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let result: Result<(), String> = async {
+        register(&app, &token, &serial).await?;
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                &format!("/api/v1/meters/{serial}/readings"),
+                &token,
+                Some(serde_json::json!({ "kwh": 1.5, "timestamp": "2031-02-03T04:05:06Z" })),
+            ))
+            .await
+            .expect("submit");
+        if resp.status() != StatusCode::OK {
+            return Err(format!("submit status {}", resp.status()));
+        }
+        let reading = json_body(resp).await;
+        let ts = reading["timestamp"].as_str().unwrap_or_default();
+        if !ts.starts_with("2031-02-03T04:05:06") {
+            return Err(format!("explicit timestamp not persisted: {ts}"));
+        }
+        Ok(())
+    }
+    .await;
+    cleanup(&pool, &serial).await;
+    result.expect("explicit-timestamp flow");
+}
+
+/// Registering with latitude/longitude persists them and surfaces them on
+/// `/me/meters`.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn http_e2e_register_persists_lat_lon() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query user");
+    let Some(user_id) = user_id else {
+        eprintln!("SKIP: no wallet-bearing user in DB");
+        return;
+    };
+    let token = mint_jwt(user_id, &secret);
+    let serial = format!("E2E-GEO-{}", Uuid::new_v4());
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let result: Result<(), String> = async {
+        let (lat, lon) = (13.7563, 100.5018);
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                "/api/v1/meters",
+                &token,
+                Some(serde_json::json!({
+                    "serial_number": serial,
+                    "meter_type": "smart_meter",
+                    "location": "bkk",
+                    "latitude": lat,
+                    "longitude": lon,
+                })),
+            ))
+            .await
+            .expect("register");
+        if resp.status() != StatusCode::OK {
+            return Err(format!("register status {}", resp.status()));
+        }
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/api/v1/me/meters", &token, None))
+            .await
+            .expect("my meters");
+        if resp.status() != StatusCode::OK {
+            return Err(format!("my-meters status {}", resp.status()));
+        }
+        let meters = json_body(resp).await;
+        let arr = meters.as_array().cloned().unwrap_or_default();
+        let m = arr
+            .iter()
+            .find(|m| m["serial_number"] == serde_json::json!(serial))
+            .ok_or("registered meter absent from /me/meters")?;
+        let approx =
+            |v: &serde_json::Value, want: f64| v.as_f64().is_some_and(|g| (g - want).abs() < 1e-6);
+        if !approx(&m["latitude"], lat) || !approx(&m["longitude"], lon) {
+            return Err(format!("lat/lon not persisted: {m}"));
+        }
+        Ok(())
+    }
+    .await;
+    cleanup(&pool, &serial).await;
+    result.expect("lat-lon flow");
+}
+
+/// Two SSE subscribers for the SAME user both receive a submitted reading
+/// (broadcast fan-out). Infra-free: events are sent directly on the channel.
+#[tokio::test]
+async fn sse_multiple_subscribers_same_user_both_receive() {
+    let secret = "test-secret-minimum-32-characters-long-aaaaaaaaaa";
+    let pool = PgPool::connect_lazy(DEFAULT_DB).expect("lazy pool");
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let tx = readings_tx.clone();
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_secs();
+    let user = Uuid::new_v4();
+    let token = mint_jwt_with_exp(user, secret, now + 3600);
+
+    // Two independent subscribers for the same user.
+    let sub = || {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            app.oneshot(authed(
+                "GET",
+                "/api/v1/meters/readings/stream",
+                &token,
+                None,
+            ))
+            .await
+            .expect("stream")
+            .into_body()
+            .into_data_stream()
+        }
+    };
+    let mut a = sub().await;
+    let mut b = sub().await;
+
+    // One reading for the user.
+    let mut r = sample_reading();
+    let id = Uuid::new_v4();
+    r.id = id;
+    let id = id.to_string();
+    let _ = tx.send(Arc::new(ReadingEvent {
+        user_id: user,
+        reading: r,
+    }));
+
+    assert!(
+        sse_recv_contains(&mut a, &id).await,
+        "subscriber A missed the reading"
+    );
+    assert!(
+        sse_recv_contains(&mut b, &id).await,
+        "subscriber B missed the reading"
+    );
+}
+
+/// Drive an SSE body stream until `want` appears (or 5s elapses).
+async fn sse_recv_contains(stream: &mut axum::body::BodyDataStream, want: &str) -> bool {
+    let mut text = String::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = stream.next().await {
+            text.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+            if text.contains(want) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Remove the meter + readings this test created. Never touches the user.

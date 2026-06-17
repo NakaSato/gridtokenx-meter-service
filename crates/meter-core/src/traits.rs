@@ -41,4 +41,15 @@ pub trait MeterRepositoryTrait: Send + Sync {
         wallet_address: &str,
         timestamp: Option<&str>,
     ) -> Result<MeterReading>;
+
+    /// Total number of readings owned by the user (for pagination metadata).
+    async fn count_user_readings(&self, user_id: Uuid) -> Result<i64>;
+
+    /// Newest readings whose mint is **resolved** (`minted` or `denied`), each
+    /// paired with its owning `user_id`. Drives the mint-status SSE poller, which
+    /// diffs successive snapshots to detect transitions. Bounded by `limit`.
+    async fn list_resolved_mint_readings(&self, limit: i64) -> Result<Vec<(Uuid, MeterReading)>>;
+
+    /// Readiness probe: succeeds when the backing store is reachable.
+    async fn ping(&self) -> Result<()>;
 }

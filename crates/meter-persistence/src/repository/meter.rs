@@ -56,6 +56,15 @@ fn reading_select(filter: &str) -> String {
     )
 }
 
+/// Row for [`MeterRepositoryTrait::list_resolved_mint_readings`]: a reading plus
+/// its owning `user_id` (which `MeterReading` itself does not carry).
+#[derive(sqlx::FromRow)]
+struct ResolvedMintRow {
+    user_id: Uuid,
+    #[sqlx(flatten)]
+    reading: MeterReading,
+}
+
 /// SQLx-backed implementation of [`MeterRepositoryTrait`].
 pub struct MeterRepository {
     pool: PgPool,
@@ -102,6 +111,45 @@ impl MeterRepositoryTrait for MeterRepository {
             .await?;
 
         Ok(readings)
+    }
+
+    async fn count_user_readings(&self, user_id: Uuid) -> Result<i64> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM meter_readings WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(total)
+    }
+
+    async fn list_resolved_mint_readings(&self, limit: i64) -> Result<Vec<(Uuid, MeterReading)>> {
+        // Same reading projection as `reading_select`, plus the owning user_id,
+        // filtered to readings whose mint is resolved (minted or denied).
+        let sql = format!(
+            "SELECT user_id,
+                    id,
+                    COALESCE(meter_serial, '')                          AS meter_serial,
+                    COALESCE(kwh_amount, 0)::float8                     AS kwh,
+                    to_char(timestamp  AT TIME ZONE 'UTC', '{TS_FMT}')  AS timestamp,
+                    to_char(created_at AT TIME ZONE 'UTC', '{TS_FMT}')  AS submitted_at,
+                    energy_generated::float8                            AS energy_generated,
+                    energy_consumed::float8                             AS energy_consumed,
+                    voltage::float8                                     AS voltage,
+                    current::float8                                     AS current,
+                    {MINT_STATUS_CASE}                                  AS mint_status,
+                    mint_tx_signature                                   AS mint_tx_signature
+             FROM meter_readings
+             WHERE COALESCE(minted, false) OR COALESCE(on_chain_confirmed, false)
+                OR blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL
+             ORDER BY timestamp DESC
+             LIMIT $1"
+        );
+        let rows = sqlx::query_as::<_, ResolvedMintRow>(&sql)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.into_iter().map(|r| (r.user_id, r.reading)).collect())
     }
 
     async fn user_stats(&self, user_id: Uuid) -> Result<MeterStats> {
@@ -198,5 +246,10 @@ impl MeterRepositoryTrait for MeterRepository {
             .await?;
 
         Ok(reading)
+    }
+
+    async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
     }
 }

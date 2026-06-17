@@ -51,6 +51,27 @@ impl MeterService {
         self.repo.list_user_readings(user_id, limit, offset).await
     }
 
+    /// Lists a bounded page of readings plus pagination metadata: the total
+    /// count across all the user's readings and whether more pages follow.
+    /// `has_more` is computed from the **clamped** offset, so it stays correct
+    /// when the caller passes an out-of-range `limit`/`offset`.
+    ///
+    /// # Errors
+    /// Returns an error if either underlying query fails.
+    pub async fn list_my_readings_page(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<MeterReading>, i64, bool)> {
+        let limit = limit.clamp(1, MAX_READINGS_LIMIT);
+        let offset = offset.max(0);
+        let items = self.repo.list_user_readings(user_id, limit, offset).await?;
+        let total = self.repo.count_user_readings(user_id).await?;
+        let has_more = offset + i64::try_from(items.len()).unwrap_or(i64::MAX) < total;
+        Ok((items, total, has_more))
+    }
+
     /// Aggregates the user's meter stats.
     ///
     /// # Errors
@@ -135,6 +156,23 @@ impl MeterService {
             .insert_reading(user_id, serial, req.kwh, &wallet, req.timestamp.as_deref())
             .await
     }
+
+    /// Readiness probe: verifies the backing store is reachable.
+    ///
+    /// # Errors
+    /// Returns an error if the repository ping fails (e.g. Postgres unreachable).
+    pub async fn check_ready(&self) -> Result<()> {
+        self.repo.ping().await
+    }
+
+    /// Newest resolved-mint readings (minted/denied) with their owning `user_id`,
+    /// for the mint-status SSE poller. Bounded by `limit`.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying query fails.
+    pub async fn poll_resolved_mints(&self, limit: i64) -> Result<Vec<(Uuid, MeterReading)>> {
+        self.repo.list_resolved_mint_readings(limit).await
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +190,12 @@ mod tests {
     struct FakeRepo {
         /// `Some(wallet)` = a meter exists with that owner wallet.
         meter_wallet: Option<String>,
+        /// When true, `ping` returns an error (simulates an unreachable store).
+        ping_should_fail: bool,
+        /// Total returned by `count_user_readings` (pagination metadata).
+        readings_count: i64,
+        /// Returned by `list_resolved_mint_readings`.
+        resolved_mints: Vec<(Uuid, MeterReading)>,
         /// Captures.
         readings_page: Mutex<Option<(i64, i64)>>,
         inserted_wallet: Mutex<Option<String>>,
@@ -247,6 +291,25 @@ mod tests {
             *self.inserted_serial.lock().expect("lock") = Some(meter_serial.to_string());
             Ok(reading())
         }
+
+        async fn count_user_readings(&self, _user_id: Uuid) -> Result<i64> {
+            Ok(self.readings_count)
+        }
+
+        async fn list_resolved_mint_readings(
+            &self,
+            _limit: i64,
+        ) -> Result<Vec<(Uuid, MeterReading)>> {
+            Ok(self.resolved_mints.clone())
+        }
+
+        async fn ping(&self) -> Result<()> {
+            if self.ping_should_fail {
+                Err(ApiError::Unavailable("store unreachable".to_string()))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     fn service(repo: FakeRepo) -> MeterService {
@@ -276,6 +339,32 @@ mod tests {
 
         let _ = svc.list_my_readings(Uuid::nil(), 0, 7).await.expect("ok");
         assert_eq!(*repo.readings_page.lock().expect("lock"), Some((1, 7)));
+    }
+
+    #[tokio::test]
+    async fn readings_page_reports_total_and_has_more() {
+        // FakeRepo returns an empty page but a configurable total, so this pins
+        // the metadata arithmetic: has_more = clamped_offset + items.len < total.
+        let svc = service(FakeRepo {
+            readings_count: 5,
+            ..Default::default()
+        });
+        let (items, total, has_more) = svc
+            .list_my_readings_page(Uuid::nil(), 10, 0)
+            .await
+            .expect("ok");
+        assert!(items.is_empty());
+        assert_eq!(total, 5);
+        assert!(has_more, "0 + 0 < 5 should report more pages");
+
+        // No readings → no more pages.
+        let svc = service(FakeRepo::default());
+        let (_, total, has_more) = svc
+            .list_my_readings_page(Uuid::nil(), 10, 0)
+            .await
+            .expect("ok");
+        assert_eq!(total, 0);
+        assert!(!has_more, "0 < 0 should report no more pages");
     }
 
     // --- register ----------------------------------------------------------
@@ -438,5 +527,23 @@ mod tests {
             .await
             .expect_err("should reject");
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    // --- readiness ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn check_ready_ok_when_store_reachable() {
+        let svc = service(FakeRepo::default());
+        svc.check_ready().await.expect("ready");
+    }
+
+    #[tokio::test]
+    async fn check_ready_errors_when_store_unreachable() {
+        let svc = service(FakeRepo {
+            ping_should_fail: true,
+            ..Default::default()
+        });
+        let err = svc.check_ready().await.expect_err("should fail");
+        assert!(matches!(err, ApiError::Unavailable(_)));
     }
 }

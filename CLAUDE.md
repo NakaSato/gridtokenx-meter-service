@@ -83,7 +83,8 @@ Traits defined in `meter-core/src/traits.rs`, implemented in `meter-persistence`
 `bin/meter-service/src/startup.rs`. Add new behavior by picking the crate per the dependency rule.
 
 ### Routes (`startup.rs`)
-`GET /health` · `GET /api/v1/me/meters` · `POST /api/v1/meters` (register) ·
+`GET /health` (liveness) · `GET /health/ready` (readiness — `200`/`503` on a Postgres ping) ·
+`GET /api/v1/me/meters` · `POST /api/v1/meters` (register) ·
 `GET /api/v1/meters/readings?limit&offset` · `GET /api/v1/meters/readings/stream` (SSE) ·
 `GET /api/v1/meters/stats` · `POST /api/v1/meters/{serial}/readings`.
 
@@ -111,16 +112,17 @@ Domain field names mirror the trading UI contract (`types/meter.ts`) — keep th
   `MINT_STATUS_CASE` (`repository/meter.rs`): `minted OR on_chain_confirmed` → `"minted"`,
   `blockchain_status='failed' OR blockchain_last_error IS NOT NULL` → `"denied"`, else `"pending"`.
   `user_stats` exposes the same predicates as `minted_count`/`pending_count`/`denied_count`. The
-  realtime `submit → SSE` path always emits `"pending"` (the row is freshly inserted unminted);
-  later mint transitions are **not** pushed (no consumer) — clients re-fetch list/stats.
-- **No SSE push for mint/deny transitions — by design (won't-do).** This service does no
-  blockchain work and runs no consumer of mint/deny events; the columns flip out-of-band in
-  Postgres (written by other services), with no NATS/trigger/poll feeding back here. So a
-  reading's `mint_status` changing `pending → minted`/`denied` is **never** broadcast on the SSE
-  stream. The dashboard reconciles by re-fetching list/stats (it already polls every 30s, see the
-  trading UI `useSmartMeter`). Adding a live push would require a new event source (DB
-  `LISTEN/NOTIFY`, a NATS consumer, or a poll-and-diff loop) and is intentionally out of scope —
-  revisit only if near-real-time mint feedback becomes a product requirement.
+  realtime `submit → SSE` path emits `"pending"` (the row is freshly inserted unminted); later
+  `pending → minted`/`denied` transitions are pushed by the **mint-status poller** (below).
+- **Mint transitions reach SSE via a background poller** (`bin/meter-service/src/mint_poller.rs`).
+  The mint columns flip out-of-band in Postgres (written by other services) and `meter_readings`
+  is IAM-owned, so there's no DB trigger / `LISTEN-NOTIFY` to hook. Instead the poller snapshots
+  the newest resolved-mint readings every `METER_MINT_POLL_SECS` (default 15s; `0` disables),
+  diffs each snapshot against the last via the pure `diff_transitions`, and broadcasts only what
+  changed onto the same `readings_tx` channel the SSE handler filters by `user_id`. It **primes**
+  its seen-set on startup without broadcasting (so the minted backlog isn't replayed), and the
+  seen-set is bounded to each snapshot (≤ `POLL_LIMIT`). Best-effort: a transition that lands
+  while the service is down is not pushed — clients still reconcile by re-fetching list/stats.
 
 ---
 
@@ -131,5 +133,6 @@ Domain field names mirror the trading UI contract (`types/meter.ts`) — keep th
 | `JWT_SECRET` | — (**required**) | HS256 secret; must equal the value IAM signs tokens with. |
 | `DATABASE_URL` | `…@postgres:5432/gridtokenx` | Shared `gridtokenx` Postgres. |
 | `METER_SERVICE_PORT` / `PORT` | `8080` | Bind port (binds `0.0.0.0`). |
+| `METER_MINT_POLL_SECS` | `15` | Mint-status SSE poller interval; `0` disables it. |
 
 Dockerfile: multi-stage `rust:1-bookworm` → `debian:bookworm-slim`, exposes `8080`, healthcheck on `/health`.
