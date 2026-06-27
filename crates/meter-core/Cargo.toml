@@ -16,3 +16,7 @@ async-trait.workspace = true
 axum.workspace = true
 sqlx.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Async test runtime for IntoResponse body assertions (axum::body::to_bytes).
+tokio.workspace = true
