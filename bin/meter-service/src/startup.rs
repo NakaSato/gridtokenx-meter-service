@@ -104,7 +104,17 @@ pub fn build_app(state: AppState) -> Router {
         // accepts direct reading writes; it serves the dashboard read paths and
         // pushes mint-status transitions over SSE.
         .layer(axum::middleware::from_fn(crate::metrics::track_http))
-        .layer(TraceLayer::new_for_http())
+        // INFO-level request span so traces export to Tempo (the default
+        // make_span is DEBUG and is filtered out under the standard `info` env).
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                tracing::info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    uri = %request.uri().path(),
+                )
+            },
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
