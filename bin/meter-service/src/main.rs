@@ -4,13 +4,16 @@
 //! (meters + `meter_readings` tables; ownership by `user_id`). JWT-authed via the
 //! IAM-issued token forwarded by APISIX.
 
-use gridtokenx_meter_service::{startup, telemetry};
+use gridtokenx_meter_service::{metrics, startup, telemetry};
 use meter_core::config::Config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     telemetry::init();
+
+    // Install the Prometheus recorder before any metric is emitted.
+    metrics::install_recorder();
 
     let config = Config::from_env()?;
     startup::run(config).await

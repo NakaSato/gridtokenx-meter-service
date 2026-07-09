@@ -2,6 +2,8 @@
 //!
 //! Holds the startup wiring and telemetry init for the meter-service binary.
 
+/// Prometheus metrics: recorder install, `/metrics` render, HTTP middleware.
+pub mod metrics;
 /// Background poller that pushes mint-status transitions to SSE subscribers.
 pub mod mint_poller;
 /// Service startup and dependency wiring.

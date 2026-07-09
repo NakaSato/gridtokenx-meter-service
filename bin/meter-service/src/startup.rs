@@ -74,6 +74,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Serves Prometheus metrics in text-exposition format. Gated to internal CIDRs
+/// at the APISIX gateway (same policy as `/health`).
+async fn metrics_handler() -> String {
+    crate::metrics::render()
+}
+
 /// Builds the meter-service router from a wired [`AppState`].
 ///
 /// Extracted from [`run`] so integration tests can drive the exact same route
@@ -83,7 +89,9 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(system::health))
         .route("/health/ready", get(system::ready))
+        .route("/metrics", get(metrics_handler))
         .route("/api/v1/me/meters", get(meter::get_my_meters))
+        .route("/api/v1/meters/map", get(meter::get_meters_map))
         .route("/api/v1/meters", post(meter::register_meter))
         .route("/api/v1/meters/readings", get(meter::get_my_readings))
         .route(
@@ -91,10 +99,11 @@ pub fn build_app(state: AppState) -> Router {
             get(meter::stream_readings),
         )
         .route("/api/v1/meters/stats", get(meter::get_meter_stats))
-        .route(
-            "/api/v1/meters/{serial}/readings",
-            post(meter::submit_reading),
-        )
+        // Reading ingest removed: meter telemetry now flows **only** via the
+        // Aggregator Bridge (Ed25519-signed IoT gateway). This service no longer
+        // accepts direct reading writes; it serves the dashboard read paths and
+        // pushes mint-status transitions over SSE.
+        .layer(axum::middleware::from_fn(crate::metrics::track_http))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)

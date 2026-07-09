@@ -19,6 +19,8 @@ meter-api.workspace = true
 tokio.workspace = true
 axum.workspace = true
 tower-http.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 sqlx.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -33,3 +35,5 @@ jsonwebtoken.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 futures.workspace = true
+# Fake MeterRepositoryTrait impl in mint_poller's unit tests.
+async-trait.workspace = true

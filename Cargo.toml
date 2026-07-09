@@ -50,6 +50,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 dotenvy = "0.15"
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.17"
 
 [profile.release]
 opt-level = 2
