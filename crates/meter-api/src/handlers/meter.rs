@@ -1,9 +1,8 @@
 //! Meter endpoints. Thin — validate input, call the service, return JSON.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
@@ -12,8 +11,7 @@ use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 
 use meter_core::domain::meter::{
-    Meter, MeterReading, MeterStats, RegisterMeterRequest, RegisterMeterResponse,
-    SubmitReadingRequest,
+    Meter, MeterMapPoint, MeterReading, MeterStats, RegisterMeterRequest, RegisterMeterResponse,
 };
 use meter_core::error::Result;
 
@@ -30,6 +28,22 @@ pub async fn get_my_meters(
 ) -> Result<Json<Vec<Meter>>> {
     let meters = state.meter_service.list_my_meters(user.user_id).await?;
     Ok(Json(meters))
+}
+
+/// GET /api/v1/meters/map
+///
+/// Returns every located meter (latitude/longitude present) across **all**
+/// users as map markers. Requires a valid JWT but is intentionally not scoped
+/// to the caller — the map shows the whole grid.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn get_meters_map(
+    State(state): State<AppState>,
+    _user: AuthUser,
+) -> Result<Json<Vec<MeterMapPoint>>> {
+    let points = state.meter_service.list_map_points().await?;
+    Ok(Json(points))
 }
 
 /// Query params for the readings listing.
@@ -103,34 +117,6 @@ pub async fn register_meter(
     Ok(Json(resp))
 }
 
-/// POST /api/v1/meters/{serial}/readings — submit a reading.
-///
-/// On success the persisted reading is published to the realtime stream so any
-/// open SSE subscribers for this user receive it immediately.
-///
-/// # Errors
-/// Returns an error on invalid input or unknown meter.
-pub async fn submit_reading(
-    State(state): State<AppState>,
-    user: AuthUser,
-    Path(serial): Path<String>,
-    Json(req): Json<SubmitReadingRequest>,
-) -> Result<Json<MeterReading>> {
-    let reading = state
-        .meter_service
-        .submit_reading(user.user_id, &serial, &req)
-        .await?;
-
-    // Fan out to realtime subscribers. A send error just means no subscribers;
-    // it never fails the request.
-    let _ = state.readings_tx.send(Arc::new(ReadingEvent {
-        user_id: user.user_id,
-        reading: reading.clone(),
-    }));
-
-    Ok(Json(reading))
-}
-
 /// GET /api/v1/meters/readings/stream — realtime reading stream (SSE).
 ///
 /// Subscribes to the broadcast channel and emits the authenticated user's
@@ -179,12 +165,9 @@ mod tests {
             kwh: 1.0,
             timestamp: String::new(),
             submitted_at: String::new(),
-            energy_generated: None,
-            energy_consumed: None,
-            voltage: None,
-            current: None,
             mint_status: "pending".to_string(),
             mint_tx_signature: None,
+            ..Default::default()
         }
     }
 

@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use meter_core::domain::meter::{Meter, MeterReading, MeterStats, RegisterMeterRequest};
+use meter_core::domain::meter::{
+    Meter, MeterMapPoint, MeterReading, MeterStats, RegisterMeterRequest, ZoneFlow,
+};
 use meter_core::error::{ApiError, Result};
 use meter_core::traits::MeterRepositoryTrait;
 
@@ -49,6 +51,21 @@ fn reading_select(filter: &str) -> String {
                 energy_consumed::float8                             AS energy_consumed,
                 voltage::float8                                     AS voltage,
                 current::float8                                     AS current,
+                surplus_energy::float8                              AS surplus_energy,
+                deficit_energy::float8                              AS deficit_energy,
+                power_factor::float8                                AS power_factor,
+                frequency::float8                                   AS frequency,
+                temperature::float8                                 AS temperature,
+                battery_level::float8                               AS battery_level,
+                weather_condition                                  AS weather_condition,
+                latitude::float8                                    AS latitude,
+                longitude::float8                                   AS longitude,
+                rec_eligible                                       AS rec_eligible,
+                carbon_offset::float8                               AS carbon_offset,
+                max_sell_price::float8                              AS max_sell_price,
+                max_buy_price::float8                               AS max_buy_price,
+                meter_signature                                    AS meter_signature,
+                meter_type                                         AS meter_type,
                 {MINT_STATUS_CASE}                                  AS mint_status,
                 mint_tx_signature                                   AS mint_tx_signature
          FROM meter_readings
@@ -63,6 +80,18 @@ struct ResolvedMintRow {
     user_id: Uuid,
     #[sqlx(flatten)]
     reading: MeterReading,
+}
+
+/// Flat aggregate row for [`MeterRepositoryTrait::user_stats`]; the per-zone
+/// `zones` vec is fetched separately and assembled into [`MeterStats`].
+#[derive(sqlx::FromRow)]
+struct StatsTotals {
+    total_produced: f64,
+    total_consumed: f64,
+    last_reading_time: Option<String>,
+    minted_count: i64,
+    pending_count: i64,
+    denied_count: i64,
 }
 
 /// SQLx-backed implementation of [`MeterRepositoryTrait`].
@@ -91,6 +120,29 @@ impl MeterRepositoryTrait for MeterRepository {
             .await?;
 
         Ok(meters)
+    }
+
+    async fn list_map_meters(&self) -> Result<Vec<MeterMapPoint>> {
+        // All users, located meters only (lat/lng present). Same owner join as
+        // `meter_select`, but lat/lng are non-null here so they map to `f64`.
+        let sql = "SELECT m.id,
+                          m.serial_number,
+                          COALESCE(m.meter_type, 'smart_meter') AS meter_type,
+                          COALESCE(m.location, '')              AS location,
+                          COALESCE(m.is_verified, false)        AS is_verified,
+                          COALESCE(u.wallet_address, '')        AS wallet_address,
+                          m.latitude::float8                    AS latitude,
+                          m.longitude::float8                   AS longitude,
+                          m.zone_id
+                   FROM meters m
+                   JOIN users u ON u.id = m.user_id
+                   WHERE m.latitude IS NOT NULL AND m.longitude IS NOT NULL
+                   ORDER BY m.created_at DESC";
+        let points = sqlx::query_as::<_, MeterMapPoint>(sql)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(points)
     }
 
     async fn list_user_readings(
@@ -136,6 +188,21 @@ impl MeterRepositoryTrait for MeterRepository {
                     energy_consumed::float8                             AS energy_consumed,
                     voltage::float8                                     AS voltage,
                     current::float8                                     AS current,
+                    surplus_energy::float8                              AS surplus_energy,
+                    deficit_energy::float8                              AS deficit_energy,
+                    power_factor::float8                                AS power_factor,
+                    frequency::float8                                   AS frequency,
+                    temperature::float8                                 AS temperature,
+                    battery_level::float8                               AS battery_level,
+                    weather_condition                                  AS weather_condition,
+                    latitude::float8                                    AS latitude,
+                    longitude::float8                                   AS longitude,
+                    rec_eligible                                       AS rec_eligible,
+                    carbon_offset::float8                               AS carbon_offset,
+                    max_sell_price::float8                              AS max_sell_price,
+                    max_buy_price::float8                               AS max_buy_price,
+                    meter_signature                                    AS meter_signature,
+                    meter_type                                         AS meter_type,
                     {MINT_STATUS_CASE}                                  AS mint_status,
                     mint_tx_signature                                   AS mint_tx_signature
              FROM meter_readings
@@ -161,23 +228,55 @@ impl MeterRepositoryTrait for MeterRepository {
                 COUNT(*) FILTER (WHERE COALESCE(minted, false) OR COALESCE(on_chain_confirmed, false))::int8                         AS minted_count,
                 COUNT(*) FILTER (WHERE blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL)::int8                       AS denied_count,
                 COUNT(*) FILTER (WHERE NOT (COALESCE(minted, false) OR COALESCE(on_chain_confirmed, false))
-                                   AND NOT (blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL))::int8               AS pending_count
+                                   AND NOT COALESCE(blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL, false))::int8 AS pending_count
              FROM meter_readings
              WHERE user_id = $1"
         );
 
-        let stats = sqlx::query_as::<_, MeterStats>(&sql)
+        let totals = sqlx::query_as::<_, StatsTotals>(&sql)
             .bind(user_id)
             .fetch_one(&self.pool)
             .await?;
 
-        Ok(stats)
+        // Per-zone energy flow: join each reading to its meter for the zone_id,
+        // group by zone (unzoned meters group under NULL, ordered last).
+        let zone_sql = "SELECT
+                m.zone_id                                                          AS zone_id,
+                COALESCE(SUM(r.energy_generated), 0)::float8                        AS total_produced,
+                COALESCE(SUM(r.energy_consumed), 0)::float8                         AS total_consumed,
+                (COALESCE(SUM(r.energy_generated), 0)
+                    - COALESCE(SUM(r.energy_consumed), 0))::float8                  AS net_flow,
+                COUNT(*)::int8                                                      AS reading_count
+             FROM meter_readings r
+             JOIN meters m ON m.user_id = r.user_id AND m.serial_number = r.meter_serial
+             WHERE r.user_id = $1
+             GROUP BY m.zone_id
+             ORDER BY m.zone_id ASC NULLS LAST";
+        let zones = sqlx::query_as::<_, ZoneFlow>(zone_sql)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(MeterStats {
+            total_produced: totals.total_produced,
+            total_consumed: totals.total_consumed,
+            last_reading_time: totals.last_reading_time,
+            minted_count: totals.minted_count,
+            pending_count: totals.pending_count,
+            denied_count: totals.denied_count,
+            zones,
+        })
     }
 
     async fn register_meter(&self, user_id: Uuid, req: &RegisterMeterRequest) -> Result<Meter> {
+        // is_verified = true: registration is JWT-scoped to an authenticated user and
+        // the device streams Ed25519-signed telemetry the Aggregator Bridge verifies,
+        // so the meter is verified at registration. No separate verification flow exists
+        // (the old meter_verification_attempts schema is unwired), and the trading UI
+        // gates "My Meters" on this flag — leaving it false shows every meter Unverified.
         let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO meters (user_id, serial_number, meter_type, location, latitude, longitude)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO meters (user_id, serial_number, meter_type, location, latitude, longitude, is_verified)
+             VALUES ($1, $2, $3, $4, $5, $6, true)
              RETURNING id",
         )
         .bind(user_id)
@@ -213,39 +312,6 @@ impl MeterRepositoryTrait for MeterRepository {
                 .await?;
 
         Ok(meter)
-    }
-
-    async fn insert_reading(
-        &self,
-        user_id: Uuid,
-        meter_serial: &str,
-        kwh: f64,
-        wallet_address: &str,
-        timestamp: Option<&str>,
-    ) -> Result<MeterReading> {
-        let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO meter_readings
-                (id, user_id, wallet_address, meter_serial, kwh_amount,
-                 timestamp, energy_generated, minted)
-             VALUES
-                (gen_random_uuid(), $1, $2, $3, $4,
-                 COALESCE($5::timestamptz, now()), $4, false)
-             RETURNING id",
-        )
-        .bind(user_id)
-        .bind(wallet_address)
-        .bind(meter_serial)
-        .bind(kwh)
-        .bind(timestamp)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let reading = sqlx::query_as::<_, MeterReading>(&reading_select("id = $1"))
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await?;
-
-        Ok(reading)
     }
 
     async fn ping(&self) -> Result<()> {

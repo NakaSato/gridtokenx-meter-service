@@ -1,20 +1,23 @@
 # gridtokenx-meter-service
 
-A small, **chain-light** Axum service backing the trading UI's Smart Meter dashboard. It owns no
-schema of its own: it reads/writes the shared `gridtokenx` Postgres (`meters`, `meter_readings`,
-joined to `users` for the wallet). It does **not** depend on Solana / blockchain-core — it mints by
-sending *intent* to **Chain Bridge over NATS** and mirrors the wire types locally.
+A small, **chain-light, read-mostly** Axum service backing the trading UI's Smart Meter dashboard.
+It owns no schema of its own: it reads the shared `gridtokenx` Postgres (`meters`, `meter_readings`,
+joined to `users` for the wallet). It does **no blockchain work** — no minting, no Chain Bridge, no
+NATS, no Solana. It serves the dashboard read paths plus a realtime push stream, and reads the
+`meter_readings` mint columns **read-only** to surface a `mint_status` (`minted`/`pending`/`denied`).
 
 > Git submodule of the [`gridtokenx-coresystem`](https://github.com/NakaSato) superproject.
 
-## Ingress paths
+## Ingress
 
-Two paths feed the same core service:
+A single ingress: **HTTP (JWT-authed)** via APISIX. User scoping is by `user_id` from the JWT `sub`.
 
-1. **HTTP (JWT-authed)** — the trading UI via APISIX. User scoping is by `user_id` from the JWT `sub`.
-2. **NATS consumer (no auth)** — the **aggregator bridge** forwards verified, *mintable* readings
-   (surplus generation, `net_kwh > 0`) on a subject. These carry no user, so they are attributed to
-   the **registered owner of the meter serial**, then best-effort minted.
+> **Reading ingest is NOT here.** Meter telemetry is ingested **only** via the Aggregator Bridge
+> (Ed25519-signed IoT gateway → zone Redis Streams / InfluxDB / Kafka). This service does **not**
+> accept direct reading writes — the former `POST /api/v1/meters/{serial}/readings` route and the
+> repository's reading-insert path were removed. `meter_readings` rows are written by other services;
+> this service only reads them. **Do not re-add a reading-ingest endpoint, NATS consumer, or mint
+> path here** — minting now lives in the Aggregator Bridge settlement sink (Chain Bridge over NATS).
 
 ## Architecture — layered, trait-DI ("sync-ish core, async edges")
 
@@ -23,39 +26,52 @@ Dependency direction (never reverse):
 
 | Crate | Role |
 | --- | --- |
-| `meter-core` | Domain models, `Config` (env), `ApiError`, and the **traits** (`MeterRepositoryTrait`, `MintGateway`). |
-| `meter-logic` | `MeterService` — business rules (kWh validation, page clamping, wallet fallback, idempotent ingest, best-effort mint). Unit-testable with no DB/NATS. |
-| `meter-persistence` | Concrete impls: `MeterRepository` (SQLx/Postgres) + mint gateways (`NatsMintGateway`, `DisabledMintGateway`). |
-| `meter-api` | Axum handlers (thin), `AppState` DI container, JWT auth extractor. |
-| `bin/meter-service` | `startup::run` wires impls as `Arc<dyn Trait>`, builds router, spawns the NATS consumer, serves. Plus `reading_consumer` + `telemetry`. |
+| `meter-core` | Domain models, `Config` (env), `ApiError`, and the **`MeterRepositoryTrait`** contract. |
+| `meter-logic` | `MeterService` — business rules (kWh validation, page clamping, wallet fallback, serial normalization). Depends only on `meter-core`, so it's unit-testable with no DB. |
+| `meter-persistence` | `MeterRepository` (SQLx/Postgres) — the concrete `MeterRepositoryTrait` impl. |
+| `meter-api` | Axum handlers (thin), `AppState` DI container, JWT auth extractor, and the SSE realtime stream (`broadcast` channel). |
+| `bin/meter-service` | `startup::run` wires `MeterRepository` as `Arc<dyn MeterRepositoryTrait>` into `MeterService`, builds the router, spawns the mint-status SSE poller, serves. Plus `telemetry`. |
 
 ## Routes
 
 ```
 GET  /health
+GET  /health/ready
 GET  /api/v1/me/meters
+GET  /api/v1/meters/map
 POST /api/v1/meters                              # register
 GET  /api/v1/meters/readings?limit&offset
+GET  /api/v1/meters/readings/stream              # SSE (mint-status transitions)
 GET  /api/v1/meters/stats
-POST /api/v1/meters/{serial}/readings?auto_mint
-POST /api/v1/meters/readings/{reading_id}/mint
 ```
 
-Domain field names mirror the trading UI contract (`types/meter.ts`) — keep them in sync.
+There is **no** reading-ingest route and **no** mint route. Domain field names mirror the trading UI
+contract (`types/meter.ts`) — keep them in sync.
 
 ## Critical invariants
 
-- **Degraded-by-design startup.** Missing/unreachable NATS never takes the HTTP API down: the reading
-  consumer is skipped and the mint gateway falls back to `DisabledMintGateway` (503 on mint). Only
-  `JWT_SECRET` is hard-required by `Config::from_env`.
-- **Mint is always best-effort; the reading is always persisted first.** A mint failure is recorded in
-  `message` / logged, never lost — it can be minted later via the explicit endpoint.
-- **Idempotency.** Device ingest uses `reading_id` as the row primary key (duplicate delivery = no-op
-  insert). `mint_existing` rejects an already-minted reading (`Conflict`). On-chain mint idempotency key
-  is `mint:{serial}:{window_start_ms}` with a **15-minute window** that must match the aggregator's
-  billing window.
-- **Device-path wallet trust.** For NATS-forwarded readings the credited wallet is the registered
-  owner's wallet (resolved by serial), **never a value off the wire**.
+- **`JWT_SECRET` is the only hard-required config.** Everything else has a default.
+- **No reading-ingest path.** This service does not write `meter_readings` (no submit endpoint, no
+  repository insert). Telemetry is ingested by the Aggregator Bridge; the only events the broadcast
+  channel carries are mint-status transitions from the background poller (below).
+- **Mint status is read-only, derived in SQL.** The shared `meter_readings` table has `minted`,
+  `mint_tx_signature`, `blockchain_*`, `on_chain_*` columns, populated by **other** services. This
+  service never **writes** them. It **reads** them to derive `mint_status` via `MINT_STATUS_CASE`
+  (`repository/meter.rs`): `minted OR on_chain_confirmed` → `"minted"`, `blockchain_status='failed'
+  OR blockchain_last_error IS NOT NULL` → `"denied"`, else `"pending"`. `user_stats` exposes the same
+  predicates as `minted_count`/`pending_count`/`denied_count`.
+- **Mint transitions reach SSE via a background poller** (`bin/meter-service/src/mint_poller.rs`).
+  The mint columns flip out-of-band in Postgres (written by other services) and `meter_readings` is
+  IAM-owned, so there's no DB trigger / `LISTEN-NOTIFY` to hook. The poller snapshots the newest
+  resolved-mint readings every `METER_MINT_POLL_SECS` (default 15s; `0` disables), diffs each
+  snapshot via the pure `diff_transitions`, and broadcasts only what changed onto the `readings_tx`
+  channel the SSE handler filters by `user_id`. It primes its seen-set on startup without
+  broadcasting (no backlog replay). Best-effort: a transition that lands while the service is down is
+  not pushed — clients reconcile by re-fetching list/stats.
+- **SSE is filtered per-user.** `stream_readings` emits only events whose `user_id` matches the
+  authenticated user. Lagged subscribers skip missed events rather than closing the stream.
+- **Serial normalization.** Registration stores the trimmed serial so lookups by a whitespace-padded
+  serial still resolve the meter.
 
 ## Build, run, test
 
@@ -65,8 +81,8 @@ superproject root.
 ```bash
 cargo check                          # fast feedback
 cargo build --release --bin meter-service
-cargo test                           # unit tests (no infra needed)
-cargo test -p meter-persistence      # one crate
+cargo test                           # unit + infra-free router tests (no infra needed)
+cargo test -p meter-logic            # one crate
 ```
 
 **SQLx is runtime-checked here, not compile-time** (queries are string-built via
@@ -75,17 +91,10 @@ run unit tests — the DB is only touched at runtime.
 
 ### Integration tests (require live infra, `#[ignore]` by default)
 
-In `bin/meter-service/tests/`. Both need Postgres + NATS and a pre-registered meter serial:
-
-```bash
-# Stage 2B/3 — fake Chain Bridge (NATS responder), no Solana/Vault needed:
-DATABASE_URL=postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx \
-NATS_URL=nats://127.0.0.1:9020 TEST_METER_SERIAL=<registered-serial> \
-cargo test -p gridtokenx-meter-service --test mint_e2e -- --ignored --nocapture
-
-# Stage 2C — REAL on-chain mint via live Chain Bridge + Solana validator:
-... cargo test -p gridtokenx-meter-service --test mint_onchain_e2e -- --ignored --nocapture
-```
+The DB-gated `e2e_http` suite (`bin/meter-service/tests/e2e_http.rs`) runs against a live stack
+(register + read, all three `mint_status` branches incl. synthetic minted/denied injection,
+multi-user list isolation, pagination, aggregates, and that the removed reading-ingest route 404s).
+It is **not** run in CI (shared IAM-owned partitioned schema) — see [TESTING.md](TESTING.md).
 
 Lints are strict: `unsafe_code = deny`, `clippy::pedantic = warn`, `clippy::unwrap_used = deny`,
 `missing_docs = warn`. Don't introduce `.unwrap()`.
@@ -97,18 +106,8 @@ Lints are strict: `unsafe_code = deny`, `clippy::pedantic = warn`, `clippy::unwr
 | `JWT_SECRET` | — (**required**) | HS256 secret; must equal the value IAM signs tokens with. |
 | `DATABASE_URL` | `…@postgres:5432/gridtokenx` | Shared `gridtokenx` Postgres. |
 | `METER_SERVICE_PORT` / `PORT` | `8080` | Bind port (binds `0.0.0.0`). |
-| `NATS_URL` | unset → consumer + mint disabled | NATS for the device consumer and Chain Bridge mint. |
-| `METER_SERVICE_NATS_SUBJECT` | `meter.reading` | Subject the aggregator forwards mintable readings on. |
-| `MINT_VIA_CHAIN_BRIDGE` | `false` | When true **and** `NATS_URL` set, mint via Chain Bridge; else minting disabled (503). |
-| `CHAIN_BRIDGE_SERVICE_IDENTITY` | `spiffe://gridtokenx.th/prod/meter-service` | SPIFFE identity asserted to Chain Bridge for mint RBAC. |
+| `METER_MINT_POLL_SECS` | `15` | Mint-status SSE poller interval; `0` disables it. |
 
 ## Docker
 
 Multi-stage `rust:1-bookworm` → `debian:bookworm-slim`, exposes `8080`, healthcheck on `/health`.
-
-## Security — known production gap
-
-`NatsMintGateway` sends the mint envelope **unsigned** with a spoofable `service_identity`. The bridge
-accepts this **only in dev** (signature enforcement off). In production the bridge MUST enforce signing
-and meter-service MUST attach an `EnvelopeAuth` (its mTLS client cert). Tracked as a production-hardening
-follow-up — see the SECURITY note in `crates/meter-persistence/src/infra/mint.rs`.

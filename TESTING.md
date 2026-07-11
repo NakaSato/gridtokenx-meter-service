@@ -32,11 +32,13 @@ Pure, mock-free layer — no DB. `cargo test -p meter-logic` runs all of these.
 | Critical point | What's asserted | Test |
 | --- | --- | --- |
 | page clamp | `limit` clamps to `1..=500`, negative `offset` → 0 | `list_readings_clamps_to_500_1_and_0` |
+| page metadata | total count + `has_more` computed from clamped offset | `readings_page_reports_total_and_has_more` |
 | register validation | blank serial → `BadRequest`; serial stored trimmed | `register_meter_rejects_empty_serial`, `register_meter_persists_trimmed_serial` |
-| kWh validation | negative / non-finite kWh → `BadRequest`; `0.0` is the accepted lower bound | `submit_rejects_negative_kwh`, `submit_rejects_non_finite_kwh`, `submit_accepts_zero_kwh_boundary` |
-| meter ownership | unknown serial → `NotFound` | `submit_unknown_meter_is_not_found` |
-| serial normalization | submit trims the path serial before lookup/persist (symmetry with registration) | `submit_trims_path_serial_before_persisting` |
-| wallet fallback | blank request wallet → owner wallet; present → request wallet; none anywhere → `BadRequest` | `submit_falls_back_to_owner_wallet_when_request_blank`, `submit_uses_request_wallet_when_present`, `submit_rejects_when_no_wallet_anywhere` |
+| per-zone flow | stats surface per-zone produced/consumed/net_flow | `my_stats_surfaces_per_zone_flow` |
+| readiness | repository ping ok / errors propagate | `check_ready_ok_when_store_reachable`, `check_ready_errors_when_store_unreachable` |
+
+> Reading-ingest validation (kWh bounds, meter-ownership lookup, wallet fallback) was removed with
+> the ingest endpoint — readings now arrive via the Aggregator Bridge, not this service.
 
 ### `meter-api` — realtime SSE filter (`src/handlers/meter.rs`)
 
@@ -66,13 +68,11 @@ so they never perturb other tests' SUM-aggregate deltas under parallel runs.
 
 | Test | Critical point |
 | --- | --- |
-| `http_e2e_register_submit_stream_stats` | Full flow: register → submit → SSE → list → stats; fresh reading is `pending`. |
+| `http_e2e_register_and_read` | Register → inject a pending reading (as the Aggregator Bridge would write it) → list shows it `pending` → stats `pending_count >= 1`. |
 | `http_e2e_mint_status_minted_and_denied` | **minted + denied** branches: inject one minted (tx sig) + one denied (`blockchain_status='failed'`) row, assert list `mint_status` + `mint_tx_signature` and stats `minted_count` / `denied_count`. |
-| `http_e2e_wallet_fallback_and_serial_norm` | Padded serial + blank wallet → stored row credits owner wallet, serial stored trimmed. |
 | `http_e2e_my_meters` | Registered meter appears in `GET /me/meters`. |
-| `http_e2e_error_paths` | Negative kWh → 400, unknown serial → 404, duplicate serial → 409. |
-| `http_e2e_multi_user_isolation` | List scoping + SSE per-user filter (B's reading never reaches A). |
-| `http_e2e_cross_user_submit_forbidden` | **Authz**: A submits to B's serial → 404, and no row leaks under B's meter. |
+| `http_e2e_error_paths` | Duplicate serial → 409; the removed reading-ingest route `POST /api/v1/meters/{serial}/readings` → 404. |
+| `http_e2e_multi_user_isolation` | List scoping: each user sees only their own injected readings (B's never appears in A's list). |
 | `http_e2e_reading_fields_and_aggregates` | Optional energy fields project through; stats SUMs move by exact injected delta. |
 | `http_e2e_pagination` | `limit` page cap, over-max clamp, negative offset clamp. |
 

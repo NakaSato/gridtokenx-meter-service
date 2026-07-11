@@ -6,8 +6,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use meter_core::domain::meter::{
-    Meter, MeterReading, MeterStats, RegisterMeterRequest, RegisterMeterResponse,
-    SubmitReadingRequest,
+    Meter, MeterMapPoint, MeterReading, MeterStats, RegisterMeterRequest, RegisterMeterResponse,
 };
 use meter_core::error::{ApiError, Result};
 use meter_core::traits::MeterRepositoryTrait;
@@ -34,6 +33,14 @@ impl MeterService {
     /// Returns an error if the underlying query fails.
     pub async fn list_my_meters(&self, user_id: Uuid) -> Result<Vec<Meter>> {
         self.repo.list_user_meters(user_id).await
+    }
+
+    /// Lists all located meters across every user for the map view.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying query fails.
+    pub async fn list_map_points(&self) -> Result<Vec<MeterMapPoint>> {
+        self.repo.list_map_meters().await
     }
 
     /// Lists a bounded page of the user's readings.
@@ -113,50 +120,6 @@ impl MeterService {
         })
     }
 
-    /// Submits a reading for one of the user's meters and persists it.
-    ///
-    /// # Errors
-    /// Returns [`ApiError::BadRequest`] on invalid kWh / missing wallet,
-    /// [`ApiError::NotFound`] if the meter is not owned by the user, or a
-    /// database error.
-    pub async fn submit_reading(
-        &self,
-        user_id: Uuid,
-        serial: &str,
-        req: &SubmitReadingRequest,
-    ) -> Result<MeterReading> {
-        if req.kwh < 0.0 || !req.kwh.is_finite() {
-            return Err(ApiError::BadRequest(
-                "kwh must be a non-negative number".to_string(),
-            ));
-        }
-
-        // Match registration, which stores the trimmed serial: trim the path
-        // serial so a padded value still resolves the meter (and is stored
-        // canonically on the reading).
-        let serial = serial.trim();
-        let meter = self
-            .repo
-            .find_meter_by_serial(user_id, serial)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("meter '{serial}' not found")))?;
-
-        // Wallet from the request, falling back to the meter owner's wallet.
-        let wallet = match &req.wallet_address {
-            Some(w) if !w.trim().is_empty() => w.clone(),
-            _ => meter.wallet_address.clone(),
-        };
-        if wallet.trim().is_empty() {
-            return Err(ApiError::BadRequest(
-                "no wallet_address provided and meter owner has none".to_string(),
-            ));
-        }
-
-        self.repo
-            .insert_reading(user_id, serial, req.kwh, &wallet, req.timestamp.as_deref())
-            .await
-    }
-
     /// Readiness probe: verifies the backing store is reachable.
     ///
     /// # Errors
@@ -180,7 +143,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use meter_core::domain::meter::MeterStats;
+    use meter_core::domain::meter::{MeterStats, ZoneFlow};
 
     const OWNER_WALLET: &str = "owner-wallet";
 
@@ -196,10 +159,10 @@ mod tests {
         readings_count: i64,
         /// Returned by `list_resolved_mint_readings`.
         resolved_mints: Vec<(Uuid, MeterReading)>,
+        /// Per-zone flow returned by `user_stats`.
+        stats_zones: Vec<ZoneFlow>,
         /// Captures.
         readings_page: Mutex<Option<(i64, i64)>>,
-        inserted_wallet: Mutex<Option<String>>,
-        inserted_serial: Mutex<Option<String>>,
         registered_serial: Mutex<Option<String>>,
     }
 
@@ -217,26 +180,14 @@ mod tests {
         }
     }
 
-    fn reading() -> MeterReading {
-        MeterReading {
-            id: Uuid::nil(),
-            meter_serial: "M1".to_string(),
-            kwh: 1.0,
-            timestamp: String::new(),
-            submitted_at: String::new(),
-            energy_generated: None,
-            energy_consumed: None,
-            voltage: None,
-            current: None,
-            mint_status: "pending".to_string(),
-            mint_tx_signature: None,
-        }
-    }
-
     #[async_trait::async_trait]
     impl MeterRepositoryTrait for FakeRepo {
         async fn list_user_meters(&self, _user_id: Uuid) -> Result<Vec<Meter>> {
             Ok(self.meter_wallet.iter().map(|w| meter(w)).collect())
+        }
+
+        async fn list_map_meters(&self) -> Result<Vec<MeterMapPoint>> {
+            Ok(vec![])
         }
 
         async fn list_user_readings(
@@ -257,6 +208,7 @@ mod tests {
                 minted_count: 0,
                 pending_count: 0,
                 denied_count: 0,
+                zones: self.stats_zones.clone(),
             })
         }
 
@@ -277,19 +229,6 @@ mod tests {
             _serial: &str,
         ) -> Result<Option<Meter>> {
             Ok(self.meter_wallet.as_deref().map(meter))
-        }
-
-        async fn insert_reading(
-            &self,
-            _user_id: Uuid,
-            meter_serial: &str,
-            _kwh: f64,
-            wallet_address: &str,
-            _timestamp: Option<&str>,
-        ) -> Result<MeterReading> {
-            *self.inserted_wallet.lock().expect("lock") = Some(wallet_address.to_string());
-            *self.inserted_serial.lock().expect("lock") = Some(meter_serial.to_string());
-            Ok(reading())
         }
 
         async fn count_user_readings(&self, _user_id: Uuid) -> Result<i64> {
@@ -314,14 +253,6 @@ mod tests {
 
     fn service(repo: FakeRepo) -> MeterService {
         MeterService::new(Arc::new(repo))
-    }
-
-    fn submit_req(kwh: f64, wallet: Option<&str>) -> SubmitReadingRequest {
-        SubmitReadingRequest {
-            kwh,
-            wallet_address: wallet.map(str::to_string),
-            timestamp: None,
-        }
     }
 
     // --- page clamping -----------------------------------------------------
@@ -367,6 +298,42 @@ mod tests {
         assert!(!has_more, "0 < 0 should report no more pages");
     }
 
+    // --- stats: per-zone flow ----------------------------------------------
+
+    #[tokio::test]
+    async fn my_stats_surfaces_per_zone_flow() {
+        // The service passes the repository's per-zone flow through unchanged;
+        // net_flow sign distinguishes a net-exporter zone from a net-importer.
+        let svc = service(FakeRepo {
+            stats_zones: vec![
+                ZoneFlow {
+                    zone_id: Some(1),
+                    total_produced: 30.0,
+                    total_consumed: 10.0,
+                    net_flow: 20.0,
+                    reading_count: 3,
+                },
+                ZoneFlow {
+                    zone_id: None,
+                    total_produced: 5.0,
+                    total_consumed: 12.0,
+                    net_flow: -7.0,
+                    reading_count: 2,
+                },
+            ],
+            ..Default::default()
+        });
+        let stats = svc.my_stats(Uuid::nil()).await.expect("ok");
+        assert_eq!(stats.zones.len(), 2);
+        assert_eq!(stats.zones[0].zone_id, Some(1));
+        assert!(stats.zones[0].net_flow > 0.0, "zone 1 is a net exporter");
+        assert_eq!(stats.zones[1].zone_id, None);
+        assert!(
+            stats.zones[1].net_flow < 0.0,
+            "unzoned group is a net importer"
+        );
+    }
+
     // --- register ----------------------------------------------------------
 
     #[tokio::test]
@@ -403,130 +370,6 @@ mod tests {
             Some("M-9".to_string())
         );
         assert_eq!(resp.meter.expect("meter").serial_number, "M-9");
-    }
-
-    // --- submit_reading: kwh validation ------------------------------------
-
-    #[tokio::test]
-    async fn submit_rejects_negative_kwh() {
-        let svc = service(FakeRepo {
-            meter_wallet: Some(OWNER_WALLET.to_string()),
-            ..Default::default()
-        });
-        let err = svc
-            .submit_reading(Uuid::nil(), "M1", &submit_req(-1.0, None))
-            .await
-            .expect_err("should reject");
-        assert!(matches!(err, ApiError::BadRequest(_)));
-    }
-
-    #[tokio::test]
-    async fn submit_rejects_non_finite_kwh() {
-        let svc = service(FakeRepo {
-            meter_wallet: Some(OWNER_WALLET.to_string()),
-            ..Default::default()
-        });
-        let err = svc
-            .submit_reading(Uuid::nil(), "M1", &submit_req(f64::NAN, None))
-            .await
-            .expect_err("should reject");
-        assert!(matches!(err, ApiError::BadRequest(_)));
-    }
-
-    #[tokio::test]
-    async fn submit_accepts_zero_kwh_boundary() {
-        // Validation rejects `kwh < 0.0`, so exactly 0.0 is the accepted lower
-        // bound — a zero reading persists rather than 400s.
-        let repo = Arc::new(FakeRepo {
-            meter_wallet: Some(OWNER_WALLET.to_string()),
-            ..Default::default()
-        });
-        let svc = MeterService::new(repo.clone());
-        svc.submit_reading(Uuid::nil(), "M1", &submit_req(0.0, None))
-            .await
-            .expect("zero kwh should be accepted");
-        assert_eq!(
-            *repo.inserted_serial.lock().expect("lock"),
-            Some("M1".to_string())
-        );
-    }
-
-    // --- submit_reading: meter lookup --------------------------------------
-
-    #[tokio::test]
-    async fn submit_unknown_meter_is_not_found() {
-        let svc = service(FakeRepo {
-            meter_wallet: None,
-            ..Default::default()
-        });
-        let err = svc
-            .submit_reading(Uuid::nil(), "M1", &submit_req(1.0, None))
-            .await
-            .expect_err("should 404");
-        assert!(matches!(err, ApiError::NotFound(_)));
-    }
-
-    // --- submit_reading: wallet fallback -----------------------------------
-
-    #[tokio::test]
-    async fn submit_falls_back_to_owner_wallet_when_request_blank() {
-        let repo = Arc::new(FakeRepo {
-            meter_wallet: Some(OWNER_WALLET.to_string()),
-            ..Default::default()
-        });
-        let svc = MeterService::new(repo.clone());
-        svc.submit_reading(Uuid::nil(), "M1", &submit_req(1.0, Some("  ")))
-            .await
-            .expect("ok");
-        assert_eq!(
-            *repo.inserted_wallet.lock().expect("lock"),
-            Some(OWNER_WALLET.to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn submit_trims_path_serial_before_persisting() {
-        let repo = Arc::new(FakeRepo {
-            meter_wallet: Some(OWNER_WALLET.to_string()),
-            ..Default::default()
-        });
-        let svc = MeterService::new(repo.clone());
-        svc.submit_reading(Uuid::nil(), "  M-9  ", &submit_req(1.0, None))
-            .await
-            .expect("ok");
-        assert_eq!(
-            *repo.inserted_serial.lock().expect("lock"),
-            Some("M-9".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn submit_uses_request_wallet_when_present() {
-        let repo = Arc::new(FakeRepo {
-            meter_wallet: Some(OWNER_WALLET.to_string()),
-            ..Default::default()
-        });
-        let svc = MeterService::new(repo.clone());
-        svc.submit_reading(Uuid::nil(), "M1", &submit_req(1.0, Some("req-wallet")))
-            .await
-            .expect("ok");
-        assert_eq!(
-            *repo.inserted_wallet.lock().expect("lock"),
-            Some("req-wallet".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn submit_rejects_when_no_wallet_anywhere() {
-        let svc = service(FakeRepo {
-            meter_wallet: Some(String::new()),
-            ..Default::default()
-        });
-        let err = svc
-            .submit_reading(Uuid::nil(), "M1", &submit_req(1.0, None))
-            .await
-            .expect_err("should reject");
-        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     // --- readiness ---------------------------------------------------------

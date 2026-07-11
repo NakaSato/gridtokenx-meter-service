@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::domain::meter::{Meter, MeterReading, MeterStats, RegisterMeterRequest};
+use crate::domain::meter::{Meter, MeterMapPoint, MeterReading, MeterStats, RegisterMeterRequest};
 use crate::error::Result;
 
 /// Read/write access to meters and meter readings, scoped by owning `user_id`.
@@ -14,6 +14,10 @@ use crate::error::Result;
 pub trait MeterRepositoryTrait: Send + Sync {
     /// Lists meters owned by the given user.
     async fn list_user_meters(&self, user_id: Uuid) -> Result<Vec<Meter>>;
+
+    /// Lists all located meters (latitude/longitude present) across every user,
+    /// for the map view. **Not** scoped by user.
+    async fn list_map_meters(&self) -> Result<Vec<MeterMapPoint>>;
 
     /// Lists a page of the user's readings, newest first.
     async fn list_user_readings(
@@ -31,16 +35,6 @@ pub trait MeterRepositoryTrait: Send + Sync {
 
     /// Looks up one of the user's meters by serial number.
     async fn find_meter_by_serial(&self, user_id: Uuid, serial: &str) -> Result<Option<Meter>>;
-
-    /// Inserts a reading for the user and returns the stored row.
-    async fn insert_reading(
-        &self,
-        user_id: Uuid,
-        meter_serial: &str,
-        kwh: f64,
-        wallet_address: &str,
-        timestamp: Option<&str>,
-    ) -> Result<MeterReading>;
 
     /// Total number of readings owned by the user (for pagination metadata).
     async fn count_user_readings(&self, user_id: Uuid) -> Result<i64>;

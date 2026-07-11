@@ -112,7 +112,11 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["error"], "database error");
         // No "RowNotFound" / sqlx detail leaked.
-        assert!(!body["error"].as_str().unwrap().to_lowercase().contains("row"));
+        assert!(!body["error"]
+            .as_str()
+            .expect("error field should be a string")
+            .to_lowercase()
+            .contains("row"));
     }
 
     #[test]
@@ -121,6 +125,9 @@ mod tests {
             ApiError::Conflict("dup".into()).to_string(),
             "conflict: dup"
         );
-        assert_eq!(ApiError::Database(sqlx::Error::RowNotFound).to_string(), "database error");
+        assert_eq!(
+            ApiError::Database(sqlx::Error::RowNotFound).to_string(),
+            "database error"
+        );
     }
 }

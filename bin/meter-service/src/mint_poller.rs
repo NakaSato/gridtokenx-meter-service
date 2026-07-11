@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use meter_api::ReadingEvent;
@@ -61,6 +61,7 @@ pub fn spawn(service: MeterService, tx: broadcast::Sender<Arc<ReadingEvent>>, in
         match service.poll_resolved_mints(POLL_LIMIT).await {
             Ok(batch) => {
                 let (_skipped, primed) = diff_transitions(batch, &HashMap::new());
+                info!(primed = primed.len(), "mint-status poller primed seen-set");
                 seen = primed;
             }
             Err(e) => warn!("mint-status poller prime failed: {e}"),
@@ -72,9 +73,23 @@ pub fn spawn(service: MeterService, tx: broadcast::Sender<Arc<ReadingEvent>>, in
             ticker.tick().await;
             match service.poll_resolved_mints(POLL_LIMIT).await {
                 Ok(batch) => {
+                    let snapshot_len = batch.len();
                     let (transitions, next) = diff_transitions(batch, &seen);
                     seen = next;
+                    if !transitions.is_empty() {
+                        info!(
+                            transitions = transitions.len(),
+                            snapshot = snapshot_len,
+                            "mint-status poll: broadcasting transitions"
+                        );
+                    }
                     for (user_id, reading) in transitions {
+                        debug!(
+                            reading_id = %reading.id,
+                            %user_id,
+                            mint_status = %reading.mint_status,
+                            "mint-status transition pushed to SSE"
+                        );
                         // Send error only means no subscribers; never fatal.
                         let _ = tx.send(Arc::new(ReadingEvent { user_id, reading }));
                     }
@@ -89,6 +104,83 @@ pub fn spawn(service: MeterService, tx: broadcast::Sender<Arc<ReadingEvent>>, in
 mod tests {
     use super::*;
 
+    use meter_core::domain::meter::{Meter, MeterMapPoint, MeterStats, RegisterMeterRequest};
+    use meter_core::error::Result;
+    use meter_core::traits::MeterRepositoryTrait;
+
+    /// Repo whose data methods are never reached: the disabled-poller path
+    /// returns before any query, so this only has to satisfy the trait.
+    struct UnusedRepo;
+
+    #[async_trait::async_trait]
+    impl MeterRepositoryTrait for UnusedRepo {
+        async fn list_user_meters(&self, _user_id: Uuid) -> Result<Vec<Meter>> {
+            Ok(vec![])
+        }
+        async fn list_map_meters(&self) -> Result<Vec<MeterMapPoint>> {
+            Ok(vec![])
+        }
+        async fn list_user_readings(
+            &self,
+            _user_id: Uuid,
+            _limit: i64,
+            _offset: i64,
+        ) -> Result<Vec<MeterReading>> {
+            Ok(vec![])
+        }
+        async fn user_stats(&self, _user_id: Uuid) -> Result<MeterStats> {
+            Ok(MeterStats {
+                total_produced: 0.0,
+                total_consumed: 0.0,
+                last_reading_time: None,
+                minted_count: 0,
+                pending_count: 0,
+                denied_count: 0,
+                zones: vec![],
+            })
+        }
+        async fn register_meter(
+            &self,
+            _user_id: Uuid,
+            _req: &RegisterMeterRequest,
+        ) -> Result<Meter> {
+            unreachable!("disabled poller never registers")
+        }
+        async fn find_meter_by_serial(
+            &self,
+            _user_id: Uuid,
+            _serial: &str,
+        ) -> Result<Option<Meter>> {
+            Ok(None)
+        }
+        async fn count_user_readings(&self, _user_id: Uuid) -> Result<i64> {
+            Ok(0)
+        }
+        async fn list_resolved_mint_readings(
+            &self,
+            _limit: i64,
+        ) -> Result<Vec<(Uuid, MeterReading)>> {
+            Ok(vec![])
+        }
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn disabled_poller_is_a_noop() {
+        // interval_secs == 0 must early-return: it spawns no task and never
+        // touches the repo, so the branch runs without a Tokio runtime and
+        // nothing is ever broadcast.
+        let service = MeterService::new(Arc::new(UnusedRepo));
+        let (tx, mut rx) = broadcast::channel::<Arc<ReadingEvent>>(4);
+        spawn(service, tx, 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "disabled poller must not broadcast anything"
+        );
+    }
+
     fn reading(id: Uuid, mint_status: &str) -> MeterReading {
         MeterReading {
             id,
@@ -96,12 +188,9 @@ mod tests {
             kwh: 1.0,
             timestamp: String::new(),
             submitted_at: String::new(),
-            energy_generated: None,
-            energy_consumed: None,
-            voltage: None,
-            current: None,
             mint_status: mint_status.to_string(),
             mint_tx_signature: None,
+            ..Default::default()
         }
     }
 

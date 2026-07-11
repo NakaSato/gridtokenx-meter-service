@@ -12,20 +12,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this service is
 
 `gridtokenx-meter-service` — a small Axum service backing the trading UI's Smart Meter
-dashboard. It owns no schema of its own: it reads/writes the **shared `gridtokenx` Postgres**
+dashboard. It owns no schema of its own: it reads the **shared `gridtokenx` Postgres**
 (`meters`, `meter_readings`, joined to `users` for the wallet). It does **no blockchain work** —
-no minting, no Chain Bridge, no NATS, no Solana. It is a pure meter registry + reading store with
-a realtime push stream. It *reads* the table's mint columns read-only to surface a
+no minting, no Chain Bridge, no NATS, no Solana. It is a **read-mostly** meter registry + reading
+**reader** with a realtime push stream. It *reads* the table's mint columns read-only to surface a
 `mint_status` (`minted`/`pending`/`denied`) for the dashboard, but never writes them.
+
+> **Reading ingest is NOT here.** Meter telemetry is ingested **only** via the Aggregator Bridge
+> (Ed25519-signed IoT gateway → zone Redis Streams / InfluxDB / Kafka). This service does **not**
+> accept direct reading writes — the former `POST /api/v1/meters/{serial}/readings` endpoint and
+> the repository's reading-insert path were removed. `meter_readings` rows are written by other
+> services; this service only reads them. Do not re-add a reading-ingest endpoint here.
 
 Responsibilities:
 
 1. **Register a meter to a user account** — `POST /api/v1/meters`, scoped to the JWT user.
-2. **Ingest readings** — `POST /api/v1/meters/{serial}/readings`, persisted to Postgres.
-3. **Serve readings/stats** — list + aggregate endpoints for the dashboard, each carrying a
+2. **Serve readings/stats** — list + aggregate endpoints for the dashboard, each carrying a
    read-only `mint_status` (and `minted`/`pending`/`denied` counts in stats).
-4. **Realtime stream** — `GET /api/v1/meters/readings/stream` (Server-Sent Events): every
-   submitted reading is fanned out to that user's open SSE subscribers.
+3. **Realtime stream** — `GET /api/v1/meters/readings/stream` (Server-Sent Events): mint-status
+   transitions (`pending → minted`/`denied`), detected by the background poller, are fanned out
+   to that user's open SSE subscribers.
 
 All ingress is **HTTP (JWT-authed)** via APISIX. User scoping is by `user_id` from the JWT `sub`.
 
@@ -59,11 +65,12 @@ Lints are strict (workspace `Cargo.toml`): `unsafe_code = deny`, `clippy::pedant
 build (run `cargo fmt` before pushing). The `#[ignore]` DB-gated e2e suite is **not** run in CI (shared
 IAM-owned, partitioned schema); it runs against a live stack — see [TESTING.md](TESTING.md).
 
-Coverage at a glance: `meter-logic` unit tests (validation, page clamp, wallet fallback,
-serial norm, kWh `0.0` boundary), `meter-api` SSE-filter unit tests, two infra-free router
-tests (auth → 401, malformed → 400/404), and the DB-gated `e2e_http` suite (all three
-`mint_status` branches incl. synthetic minted/denied injection, cross-user authz, isolation,
-pagination, aggregates). See [TESTING.md](TESTING.md) for the per-test map.
+Coverage at a glance: `meter-logic` unit tests (page-clamp, stats per-zone flow, register
+validation, readiness), `meter-api` SSE-filter unit tests, two infra-free router
+tests (auth → 401, malformed → 400/404), and the DB-gated `e2e_http` suite (register + read,
+all three `mint_status` branches incl. synthetic minted/denied injection, multi-user list
+isolation, pagination, aggregates, and that the removed reading-ingest route now 404s). See
+[TESTING.md](TESTING.md) for the per-test map.
 
 ---
 
@@ -86,7 +93,7 @@ Traits defined in `meter-core/src/traits.rs`, implemented in `meter-persistence`
 `GET /health` (liveness) · `GET /health/ready` (readiness — `200`/`503` on a Postgres ping) ·
 `GET /api/v1/me/meters` · `POST /api/v1/meters` (register) ·
 `GET /api/v1/meters/readings?limit&offset` · `GET /api/v1/meters/readings/stream` (SSE) ·
-`GET /api/v1/meters/stats` · `POST /api/v1/meters/{serial}/readings`.
+`GET /api/v1/meters/stats`. (No reading-ingest route — readings arrive via the Aggregator Bridge.)
 
 Domain field names mirror the trading UI contract (`types/meter.ts`) — keep them in sync.
 
@@ -95,16 +102,14 @@ Domain field names mirror the trading UI contract (`types/meter.ts`) — keep th
 ## Critical invariants
 
 - **`JWT_SECRET` is the only hard-required config.** Everything else has a default.
-- **Reading is always persisted, then broadcast.** `submit_reading` saves the row, then publishes
-  a `ReadingEvent` to the broadcast channel. A send error only means "no subscribers" and never
-  fails the request.
+- **No reading-ingest path.** This service does not write `meter_readings` (no submit endpoint, no
+  repository insert). Telemetry is ingested by the Aggregator Bridge; the only writes the broadcast
+  channel carries are mint-status transitions from the background poller (below).
 - **SSE is filtered per-user.** `stream_readings` subscribes to the shared broadcast channel and
   emits only events whose `user_id` matches the authenticated user (`sse_event_for_user`). Lagged
   subscribers skip missed events rather than closing the stream.
-- **Serial normalization.** Registration stores the trimmed serial; `submit_reading` trims the
-  path serial before lookup/persist so a padded value still resolves the meter.
-- **Wallet fallback.** A reading's credited wallet is the request `wallet_address`, falling back to
-  the meter owner's registered wallet; blank-everywhere → `BadRequest`.
+- **Serial normalization.** Registration stores the trimmed serial so lookups by a
+  whitespace-padded serial still resolve the meter.
 - **Mint status is read-only, derived in SQL.** The shared `meter_readings` table has `minted`,
   `mint_tx_signature`, `blockchain_*`, `on_chain_*` columns, populated by **other** services. This
   service never **writes** them (`insert_reading` writes `minted = false` only to satisfy the
