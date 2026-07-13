@@ -32,7 +32,10 @@ pub enum ApiError {
     Unavailable(String),
 
     /// Persistence / database failure.
-    #[error("database error")]
+    ///
+    /// The inner cause is included in the `Display`/log output for diagnosis, but
+    /// never reaches the HTTP client — `into_response` emits a generic message.
+    #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 }
 
@@ -125,9 +128,12 @@ mod tests {
             ApiError::Conflict("dup".into()).to_string(),
             "conflict: dup"
         );
-        assert_eq!(
-            ApiError::Database(sqlx::Error::RowNotFound).to_string(),
-            "database error"
+        // Display carries the inner cause for logs (never sent to HTTP clients —
+        // see `database_error_is_500_and_does_not_leak_internals`).
+        let db_display = ApiError::Database(sqlx::Error::RowNotFound).to_string();
+        assert!(
+            db_display.starts_with("database error: "),
+            "unexpected display: {db_display}"
         );
     }
 }
