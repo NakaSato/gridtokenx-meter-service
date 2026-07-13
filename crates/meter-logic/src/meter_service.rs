@@ -14,6 +14,25 @@ use meter_core::traits::MeterRepositoryTrait;
 /// Max readings returned by a single page.
 const MAX_READINGS_LIMIT: i64 = 500;
 
+/// Canonicalizes a meter serial for storage and lookup.
+///
+/// Trims surrounding whitespace, then — when the trimmed value is a UUID in any
+/// accepted form (hyphenated or the 32-hex "simple" form) — rewrites it to the
+/// canonical lowercase hyphenated form. This makes the same physical meter
+/// claim once regardless of the dash style or case the client sent, so the
+/// `meters_serial_number_key` UNIQUE constraint rejects a second claim of the
+/// same UUID (e.g. simulator sends `3eb1…-…-…`, a user sends `3eb1…` undashed).
+/// Non-UUID serials pass through trimmed, unchanged.
+///
+/// The Aggregator Bridge attributes readings by exact `meter_serial` match, and
+/// devices emit the hyphenated form, so canonicalizing to that form keeps the
+/// reading→owner JOIN resolving to the single surviving `meters` row.
+#[must_use]
+fn canonicalize_serial(raw: &str) -> String {
+    let trimmed = raw.trim();
+    Uuid::parse_str(trimmed).map_or_else(|_| trimmed.to_string(), |u| u.to_string())
+}
+
 /// Service layer over [`MeterRepositoryTrait`].
 #[derive(Clone)]
 pub struct MeterService {
@@ -97,16 +116,18 @@ impl MeterService {
         user_id: Uuid,
         req: &RegisterMeterRequest,
     ) -> Result<RegisterMeterResponse> {
-        let serial = req.serial_number.trim();
-        if serial.is_empty() {
+        if req.serial_number.trim().is_empty() {
             return Err(ApiError::BadRequest(
                 "serial_number is required".to_string(),
             ));
         }
-        // Persist the canonical (trimmed) serial so a reading submitted with a
-        // whitespace-padded serial still resolves the meter by exact equality.
+        // Persist the canonical serial (trimmed, UUIDs hyphenated-lowercased) so
+        // the same physical meter claims once regardless of dash style/case, and
+        // a reading submitted with a whitespace-padded serial still resolves the
+        // meter by exact equality.
+        let serial = canonicalize_serial(&req.serial_number);
         let normalized = RegisterMeterRequest {
-            serial_number: serial.to_string(),
+            serial_number: serial,
             meter_type: req.meter_type.clone(),
             location: req.location.clone(),
             latitude: req.latitude,
@@ -370,6 +391,36 @@ mod tests {
             Some("M-9".to_string())
         );
         assert_eq!(resp.meter.expect("meter").serial_number, "M-9");
+    }
+
+    #[tokio::test]
+    async fn register_meter_canonicalizes_uuid_serial() {
+        // A bare 32-hex UUID (as a user might paste) is stored hyphenated-lower,
+        // so it collides on the UNIQUE serial with the simulator's dashed form
+        // instead of creating a second `meters` row for the same physical meter.
+        let repo = Arc::new(FakeRepo::default());
+        let svc = MeterService::new(repo.clone());
+        let req = RegisterMeterRequest {
+            serial_number: "  3EB13B9046684257BDD640FB06671AD1  ".to_string(),
+            meter_type: None,
+            location: None,
+            latitude: None,
+            longitude: None,
+        };
+        svc.register_meter(Uuid::nil(), &req).await.expect("ok");
+        assert_eq!(
+            *repo.registered_serial.lock().expect("lock"),
+            Some("3eb13b90-4668-4257-bdd6-40fb06671ad1".to_string())
+        );
+    }
+
+    #[test]
+    fn canonicalize_serial_leaves_non_uuid_untouched() {
+        assert_eq!(canonicalize_serial("  METER-XYZ-1  "), "METER-XYZ-1");
+        assert_eq!(
+            canonicalize_serial("3eb13b90-4668-4257-bdd6-40fb06671ad1"),
+            "3eb13b90-4668-4257-bdd6-40fb06671ad1"
+        );
     }
 
     // --- readiness ---------------------------------------------------------
