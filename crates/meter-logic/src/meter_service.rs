@@ -14,6 +14,11 @@ use meter_core::traits::MeterRepositoryTrait;
 /// Max readings returned by a single page.
 const MAX_READINGS_LIMIT: i64 = 500;
 
+/// Max stored serial length; mirrors the `meters.serial_number varchar(100)`
+/// column so an over-long serial fails as a `400` here rather than a raw DB
+/// error at insert.
+const MAX_SERIAL_LEN: usize = 100;
+
 /// Canonicalizes a meter serial for storage and lookup.
 ///
 /// Trims surrounding whitespace, then — when the trimmed value is a UUID in any
@@ -126,6 +131,11 @@ impl MeterService {
         // a reading submitted with a whitespace-padded serial still resolves the
         // meter by exact equality.
         let serial = canonicalize_serial(&req.serial_number);
+        if serial.chars().count() > MAX_SERIAL_LEN {
+            return Err(ApiError::BadRequest(format!(
+                "serial_number too long (max {MAX_SERIAL_LEN} characters)"
+            )));
+        }
         let normalized = RegisterMeterRequest {
             serial_number: serial,
             meter_type: req.meter_type.clone(),
@@ -412,6 +422,25 @@ mod tests {
             *repo.registered_serial.lock().expect("lock"),
             Some("3eb13b90-4668-4257-bdd6-40fb06671ad1".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn register_meter_rejects_over_long_serial() {
+        let repo = Arc::new(FakeRepo::default());
+        let svc = MeterService::new(repo.clone());
+        let req = RegisterMeterRequest {
+            serial_number: "X".repeat(MAX_SERIAL_LEN + 1),
+            meter_type: None,
+            location: None,
+            latitude: None,
+            longitude: None,
+        };
+        let err = svc
+            .register_meter(Uuid::nil(), &req)
+            .await
+            .expect_err("should reject");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        assert!(repo.registered_serial.lock().expect("lock").is_none());
     }
 
     #[test]
