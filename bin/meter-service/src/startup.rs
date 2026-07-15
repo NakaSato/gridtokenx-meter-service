@@ -18,9 +18,10 @@ use tracing::info;
 use meter_api::handlers::{meter, system};
 use meter_api::{AppState, ReadingEvent};
 use meter_core::config::Config;
+use meter_core::event::MeterEventPublisher;
 use meter_core::traits::MeterRepositoryTrait;
 use meter_logic::MeterService;
-use meter_persistence::MeterRepository;
+use meter_persistence::{KafkaMeterEventPublisher, MeterRepository};
 
 /// Capacity of the realtime readings broadcast channel. Lagged subscribers skip
 /// missed events rather than blocking publishers.
@@ -43,7 +44,29 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // 2. Repository (as a trait) → service (DI).
     let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool));
-    let meter_service = MeterService::new(repo);
+
+    // 2a. Optional Kafka event publisher for meter domain events (feeds the
+    //     trading + aggregator read-models). Gated OFF by default; a bad broker
+    //     config degrades to disabled rather than failing startup.
+    let event_publisher: Option<Arc<dyn MeterEventPublisher>> = if config.events_enabled {
+        match KafkaMeterEventPublisher::new(&config.kafka_bootstrap_servers, &config.events_topic) {
+            Ok(publisher) => {
+                info!(
+                    "✅ Meter event publisher enabled (topic: {})",
+                    config.events_topic
+                );
+                Some(Arc::new(publisher))
+            }
+            Err(e) => {
+                tracing::warn!("Meter event publisher disabled — producer init failed: {e}");
+                None
+            }
+        }
+    } else {
+        info!("Meter event publisher disabled (METER_EVENTS_ENABLED unset)");
+        None
+    };
+    let meter_service = MeterService::with_event_publisher(repo, event_publisher);
 
     // 3. Realtime readings broadcast channel (submit → SSE subscribers).
     let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(READINGS_CHANNEL_CAP);

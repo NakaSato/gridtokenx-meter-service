@@ -14,6 +14,16 @@ pub struct Config {
     /// Interval (seconds) for the mint-status SSE poller
     /// (`METER_MINT_POLL_SECS`, default 15). `0` disables the poller.
     pub mint_poll_secs: u64,
+    /// Whether to emit meter domain events to Kafka (`METER_EVENTS_ENABLED`,
+    /// default `false`). When off, no producer is created and registration
+    /// behaves exactly as before.
+    pub events_enabled: bool,
+    /// Kafka topic for meter domain events (`METER_EVENTS_TOPIC`, default
+    /// `meter_events`).
+    pub events_topic: String,
+    /// Kafka bootstrap servers for the event producer
+    /// (`KAFKA_BOOTSTRAP_SERVERS`, default `kafka:9092`).
+    pub kafka_bootstrap_servers: String,
 }
 
 impl Config {
@@ -39,12 +49,23 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(15);
 
+        let events_enabled = std::env::var("METER_EVENTS_ENABLED").is_ok_and(|v| {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+        });
+        let events_topic =
+            std::env::var("METER_EVENTS_TOPIC").unwrap_or_else(|_| "meter_events".to_string());
+        let kafka_bootstrap_servers =
+            std::env::var("KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|_| "kafka:9092".to_string());
+
         Ok(Self {
             database_url,
             jwt_secret,
             port,
             database_max_connections: 10,
             mint_poll_secs,
+            events_enabled,
+            events_topic,
+            kafka_bootstrap_servers,
         })
     }
 }

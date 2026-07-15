@@ -6,7 +6,9 @@
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod event;
 pub mod traits;
 
 pub use error::{ApiError, Result};
+pub use event::{MeterEvent, MeterEventData, MeterEventPublisher};
 pub use traits::MeterRepositoryTrait;

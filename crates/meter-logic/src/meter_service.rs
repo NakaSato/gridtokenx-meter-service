@@ -9,6 +9,7 @@ use meter_core::domain::meter::{
     Meter, MeterMapPoint, MeterReading, MeterStats, RegisterMeterRequest, RegisterMeterResponse,
 };
 use meter_core::error::{ApiError, Result};
+use meter_core::event::{MeterEvent, MeterEventPublisher};
 use meter_core::traits::MeterRepositoryTrait;
 
 /// Max readings returned by a single page.
@@ -42,13 +43,34 @@ fn canonicalize_serial(raw: &str) -> String {
 #[derive(Clone)]
 pub struct MeterService {
     repo: Arc<dyn MeterRepositoryTrait>,
+    /// Optional best-effort publisher for meter domain events. `None` disables
+    /// emission entirely (default); wired in `startup` only when
+    /// `METER_EVENTS_ENABLED` is set. Publishing never blocks or fails a call.
+    event_publisher: Option<Arc<dyn MeterEventPublisher>>,
 }
 
 impl MeterService {
-    /// Creates a new service over the given repository.
+    /// Creates a new service over the given repository, with event emission
+    /// disabled. Existing callers/tests keep this signature.
     #[must_use]
     pub fn new(repo: Arc<dyn MeterRepositoryTrait>) -> Self {
-        Self { repo }
+        Self {
+            repo,
+            event_publisher: None,
+        }
+    }
+
+    /// Creates a service that emits meter domain events via `publisher` on
+    /// successful mutations. `None` behaves exactly like [`Self::new`].
+    #[must_use]
+    pub fn with_event_publisher(
+        repo: Arc<dyn MeterRepositoryTrait>,
+        publisher: Option<Arc<dyn MeterEventPublisher>>,
+    ) -> Self {
+        Self {
+            repo,
+            event_publisher: publisher,
+        }
     }
 
     /// Lists the user's meters.
@@ -144,6 +166,14 @@ impl MeterService {
             longitude: req.longitude,
         };
         let meter = self.repo.register_meter(user_id, &normalized).await?;
+
+        // Best-effort domain event AFTER the row is committed. Non-blocking and
+        // failure-isolated: the publisher spawns delivery and never returns an
+        // error, so a broker hiccup can't fail or delay this registration.
+        if let Some(publisher) = &self.event_publisher {
+            publisher.publish(MeterEvent::meter_registered(user_id, &meter));
+        }
+
         Ok(RegisterMeterResponse {
             success: true,
             message: format!("Meter '{}' registered", meter.serial_number),
