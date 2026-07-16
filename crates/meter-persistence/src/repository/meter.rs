@@ -34,7 +34,10 @@ fn meter_select(filter: &str) -> String {
                 COALESCE(u.wallet_address, '')        AS wallet_address,
                 m.latitude, m.longitude, m.zone_id
          FROM meters m
-         JOIN users u ON u.id = m.user_id
+         -- DB-per-service Phase 2: resolve the owner wallet from the local
+         -- meter_owner_read_model (serial->wallet, fed by IAM+meter events) instead
+         -- of the cross-domain IAM `users` table (absent from gridtokenx_meter).
+         LEFT JOIN meter_owner_read_model u ON u.serial_number = m.serial_number
          WHERE {filter}"
     )
 }
@@ -135,7 +138,8 @@ impl MeterRepositoryTrait for MeterRepository {
                           m.longitude::float8                   AS longitude,
                           m.zone_id
                    FROM meters m
-                   JOIN users u ON u.id = m.user_id
+                   -- DB-per-service Phase 2: owner wallet from local read-model, not IAM `users`.
+                   LEFT JOIN meter_owner_read_model u ON u.serial_number = m.serial_number
                    WHERE m.latitude IS NOT NULL AND m.longitude IS NOT NULL
                    ORDER BY m.created_at DESC";
         let points = sqlx::query_as::<_, MeterMapPoint>(sql)
