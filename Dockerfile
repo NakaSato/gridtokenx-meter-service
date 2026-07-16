@@ -1,6 +1,10 @@
 # syntax=docker/dockerfile:1.7
 # gridtokenx-meter-service — multi-stage Rust build (modular monolith workspace).
 FROM rust:1.89-bookworm AS builder
+# rdkafka (+ its zstd-sys) needs a C/C++ toolchain + cmake to build librdkafka.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential cmake clang pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
