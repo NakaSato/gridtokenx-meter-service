@@ -119,6 +119,14 @@ Domain field names mirror the trading UI contract (`types/meter.ts`) — keep th
   `user_stats` exposes the same predicates as `minted_count`/`pending_count`/`denied_count`. The
   realtime `submit → SSE` path emits `"pending"` (the row is freshly inserted unminted); later
   `pending → minted`/`denied` transitions are pushed by the **mint-status poller** (below).
+- **Owns the device-registry schema (DB-per-service Phase 2).** `migrations/0001_meter_registry.sql`
+  is meter-service's canonical DDL for `meters`, `meter_registry`, `meter_verification_attempts` —
+  the tables it is the sole writer of. IAM `users` FKs are dropped (soft uuid refs; `users` lives in
+  `gridtokenx_iam`). meter-service does **NOT** run migrations at boot: the shared `gridtokenx_meter`
+  DB has one ledger, applied by a single dedicated migrate job (see the aggregator's `migrate` bin /
+  the `_migrate` role). At cutover these tables are removed from the aggregator's `0002` and the job
+  applies this file first (`meter_readings.meter_id` FKs `meter_registry`). Verified: applies
+  standalone + composes into the full `gridtokenx_meter` schema across the split.
 - **Mint transitions reach SSE via a background poller** (`bin/meter-service/src/mint_poller.rs`).
   The mint columns flip out-of-band in Postgres (written by other services) and `meter_readings`
   is IAM-owned, so there's no DB trigger / `LISTEN-NOTIFY` to hook. Instead the poller snapshots
