@@ -1,4 +1,5 @@
-//! Live HTTP end-to-end test against the real router + shared Postgres.
+//! Live HTTP end-to-end test against the real router + this service's own
+//! `gridtokenx_meter` Postgres (DB-per-service split — see repo CLAUDE.md).
 //!
 //! Drives the exact production route table in-process via
 //! `tower::ServiceExt::oneshot` (no socket bind) and asserts the meter flow:
@@ -7,14 +8,18 @@
 //! directly (`inject_*`) the way other services write them. It also proves the
 //! read-only `mint_status` projection is wired through every read path.
 //!
-//! Self-contained: it picks an existing wallet-bearing user from the DB, uses a
-//! unique throwaway serial, and deletes the meter + readings it created. It does
-//! NOT mutate the user it borrows.
+//! Self-contained: it picks an existing wallet-bearing user from the local
+//! `meter_owner_read_model` (the owner source of truth on this split DB — NOT
+//! `users`, which lives in `gridtokenx_iam` and isn't reachable from here; see
+//! `meters.user_id` having no FK, `meter-persistence/src/repository/meter.rs`),
+//! uses a unique throwaway serial, and deletes the meter + readings it created.
+//! It does NOT mutate the user it borrows.
 //!
-//! Ignored by default (needs live Postgres). Run:
+//! Ignored by default (needs live Postgres, with `meter_owner_read_model`
+//! populated by IAM/meter events — e.g. via the running docker stack). Run:
 //!
 //! ```text
-//! DATABASE_URL=postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx \
+//! DATABASE_URL=postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx_meter \
 //! JWT_SECRET=dev-jwt-secret-key-minimum-32-characters-long-for-development-2025 \
 //! cargo test -p gridtokenx-meter-service --test e2e_http -- --ignored --nocapture
 //! ```
@@ -40,7 +45,7 @@ use meter_logic::MeterService;
 use meter_persistence::MeterRepository;
 
 const DEFAULT_DB: &str =
-    "postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx";
+    "postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx_meter";
 const DEFAULT_SECRET: &str = "dev-jwt-secret-key-minimum-32-characters-long-for-development-2025";
 
 /// HS256 JWT with `sub` + `exp`, matching what the auth extractor verifies.
@@ -105,10 +110,10 @@ async fn http_e2e_register_and_read() {
         .await
         .expect("connect Postgres");
 
-    // Borrow an existing wallet-bearing user; registration joins users for the
-    // wallet and the FK requires a real row.
+    // Borrow an existing wallet-bearing user from the local owner read-model
+    // (this DB has no `users` table post-split; `meters.user_id` carries no FK).
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -240,7 +245,7 @@ async fn http_e2e_my_meters() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -316,7 +321,7 @@ async fn http_e2e_error_paths() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -394,13 +399,18 @@ async fn run_error_paths(app: &axum::Router, token: &str, serial: &str) -> Resul
     Ok(())
 }
 
-/// A non-unique DB failure on register maps to 500 (the catch-all `_` arm in
-/// `register_meter`, distinct from the 23505 conflict path). Registering for a
-/// user id with no `users` row violates the `meters_user_id_fkey` foreign key
-/// (23503), which is not 23505, so it falls through to `ApiError::Database`.
+/// Post DB-per-service split, `meters.user_id` carries NO foreign key to
+/// `users` (which lives in `gridtokenx_iam`, unreachable from this DB — see
+/// repo CLAUDE.md "DB-per-service split"). Registering for a `user_id` with no
+/// backing user row therefore **succeeds** (soft uuid ref) instead of failing
+/// with a 23503 FK violation the way it did before the split. Authorization
+/// still comes from the JWT, not the DB — an attacker still needs a valid
+/// token for that `sub`. This test pins the current (post-split) contract so a
+/// future re-introduction of the FK is a deliberate, visible test change, not
+/// a silent behavior flip.
 #[tokio::test]
 #[ignore = "requires live Postgres"]
-async fn http_e2e_register_unknown_user_is_db_error() {
+async fn http_e2e_register_unknown_user_succeeds_soft_ref() {
     let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
     let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
 
@@ -411,11 +421,10 @@ async fn http_e2e_register_unknown_user_is_db_error() {
         .await
         .expect("connect Postgres");
 
-    // A random user id that is guaranteed absent from `users`: the FK insert
-    // fails with 23503, not the 23505 unique-violation the conflict arm matches.
+    // A random user id backed by no owner row anywhere reachable from this DB.
     let user_id = Uuid::new_v4();
     let token = mint_jwt(user_id, &secret);
-    let serial = format!("E2E-FK-{}", Uuid::new_v4());
+    let serial = format!("E2E-SOFTREF-{}", Uuid::new_v4());
 
     let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
     let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
@@ -440,13 +449,15 @@ async fn http_e2e_register_unknown_user_is_db_error() {
         ))
         .await
         .expect("register unknown user");
+    let status = resp.status();
 
-    // The insert never commits (FK rejected), so there is nothing to clean up.
+    // Clean up regardless of outcome before asserting.
+    cleanup(&pool, &serial).await;
+
     assert_eq!(
-        resp.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "unknown-user register should be a 500 DB error, got {}",
-        resp.status()
+        status,
+        StatusCode::OK,
+        "unknown-user register should succeed (no FK on meters.user_id post-split), got {status}"
     );
 }
 
@@ -515,7 +526,7 @@ async fn http_e2e_multi_user_isolation() {
 
     // Need two DISTINCT wallet-bearing users.
     let users: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 2",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 2",
     )
     .fetch_all(&pool)
     .await
@@ -767,7 +778,7 @@ async fn http_e2e_mint_status_minted_and_denied() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -914,6 +925,133 @@ async fn run_mint_status(
     Ok(())
 }
 
+/// Synthetic-injection proof of the `not_applicable` branch of `MINT_STATUS_CASE`
+/// (`blockchain_status = 'no_surplus'`, written by the Aggregator Bridge's
+/// settlement sink — `PgReadingsWriter::mark_no_surplus` — when a reading's
+/// 15-min billing window closes with net consumption, nothing to mint). Inserts
+/// one such row plus one genuinely-pending row for the same serial, then asserts
+/// the readings list surfaces `not_applicable` distinctly from `pending`, and
+/// that `pending_count` — which shares `MINT_STATUS_CASE`'s predicates — counts
+/// only the genuine pending row, not the settled-no-mint one (the bug this
+/// status exists to fix: before it, both rows showed "Pending" forever).
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn http_e2e_mint_status_not_applicable() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query user");
+    let Some(user_id) = user_id else {
+        eprintln!("SKIP: no wallet-bearing user in DB");
+        return;
+    };
+
+    let token = mint_jwt(user_id, &secret);
+    let serial = format!("E2E-NOSURPLUS-{}", Uuid::new_v4());
+
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let result = run_mint_status_not_applicable(&app, &pool, &token, &serial, user_id).await;
+    cleanup(&pool, &serial).await;
+    result.expect("not-applicable mint-status flow");
+}
+
+async fn run_mint_status_not_applicable(
+    app: &axum::Router,
+    pool: &PgPool,
+    token: &str,
+    serial: &str,
+    user_id: Uuid,
+) -> Result<(), String> {
+    macro_rules! check {
+        ($cond:expr, $($arg:tt)*) => {
+            if !$cond { return Err(format!($($arg)*)); }
+        };
+    }
+
+    register(app, token, serial).await?;
+
+    let id_no_surplus =
+        inject_reading(pool, user_id, serial, false, None, Some("no_surplus")).await?;
+    let id_pending = inject_reading(pool, user_id, serial, false, None, None).await?;
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            "/api/v1/meters/readings?limit=200",
+            token,
+            None,
+        ))
+        .await
+        .expect("readings");
+    check!(
+        resp.status() == StatusCode::OK,
+        "readings status {}",
+        resp.status()
+    );
+    let list = json_body(resp).await;
+    let arr = list.as_array().cloned().unwrap_or_default();
+    let find = |id: &str| {
+        arr.iter()
+            .find(|r| r["id"] == serde_json::json!(id))
+            .cloned()
+    };
+
+    // No-surplus row: mint_status == "not_applicable", NOT "pending".
+    let no_surplus = find(&id_no_surplus).ok_or("injected no_surplus row absent from list")?;
+    check!(
+        no_surplus["mint_status"] == serde_json::json!("not_applicable"),
+        "no_surplus row not 'not_applicable': {no_surplus}"
+    );
+
+    // Ordinary row: still "pending" (unaffected by the new branch).
+    let pending = find(&id_pending).ok_or("injected pending row absent from list")?;
+    check!(
+        pending["mint_status"] == serde_json::json!("pending"),
+        "plain row not 'pending': {pending}"
+    );
+
+    // Serial-scoped pending_count (same predicate as `user_stats`) must count
+    // ONLY the genuine pending row — the fix's whole point is that a
+    // no_surplus row stops inflating this count / showing as Pending forever.
+    let pending_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FILTER (WHERE NOT (COALESCE(minted, false) OR COALESCE(on_chain_confirmed, false))
+                                    AND NOT COALESCE(blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL, false)
+                                    AND COALESCE(blockchain_status, '') != 'no_surplus')::int8
+         FROM meter_readings WHERE meter_serial = $1",
+    )
+    .bind(serial)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("count query: {e}"))?;
+    check!(
+        pending_count == 1,
+        "serial pending_count {pending_count} != 1 (no_surplus row must not count as pending)"
+    );
+
+    Ok(())
+}
+
 /// Pagination through HTTP: `?limit` caps the page exactly, and out-of-range
 /// `limit`/`offset` are clamped (not errors). Logic-unit-tested already; this
 /// proves the query-param parse + clamp survive the real HTTP path.
@@ -931,7 +1069,7 @@ async fn http_e2e_pagination() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -1038,7 +1176,7 @@ async fn http_e2e_reading_fields_and_aggregates() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -1459,7 +1597,7 @@ async fn readings_headers_report_pagination() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -1600,7 +1738,7 @@ async fn http_e2e_mint_status_alt_predicates_and_precedence() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -1740,7 +1878,7 @@ async fn http_e2e_list_ordering_and_last_reading_time() {
         .await
         .expect("connect Postgres");
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -1844,7 +1982,7 @@ async fn http_e2e_register_persists_lat_lon() {
         .await
         .expect("connect Postgres");
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -1932,7 +2070,7 @@ async fn http_e2e_stats_per_zone_net_flow() {
         .await
         .expect("connect Postgres");
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -2180,7 +2318,7 @@ async fn http_e2e_mint_poller_pushes_transition_to_sse() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await

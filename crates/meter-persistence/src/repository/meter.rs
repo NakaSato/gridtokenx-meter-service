@@ -16,10 +16,16 @@ const TS_FMT: &str = r#"YYYY-MM-DD"T"HH24:MI:SS.MS"Z""#;
 /// Read-only derivation of a reading's token-mint status from the shared
 /// table's dormant blockchain columns. This service never writes these columns
 /// (other services / history do); it only projects them for the dashboard.
-/// Order matters: minted wins over denied wins over pending.
+/// Order matters: minted wins over denied wins over `not_applicable` wins over
+/// pending. `blockchain_status = 'no_surplus'` is written by the Aggregator
+/// Bridge's settlement sink when a reading's 15-min billing window closes with
+/// net consumption (nothing was ever going to mint) — without this branch such
+/// a reading falls into the `ELSE 'pending'` case and never leaves "Pending" in
+/// the trading UI (see `aggregator-persistence::infra::pg_readings::mark_no_surplus`).
 const MINT_STATUS_CASE: &str = "CASE
     WHEN COALESCE(minted, false) OR COALESCE(on_chain_confirmed, false) THEN 'minted'
     WHEN blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL THEN 'denied'
+    WHEN blockchain_status = 'no_surplus' THEN 'not_applicable'
     ELSE 'pending'
  END";
 
@@ -180,7 +186,8 @@ impl MeterRepositoryTrait for MeterRepository {
 
     async fn list_resolved_mint_readings(&self, limit: i64) -> Result<Vec<(Uuid, MeterReading)>> {
         // Same reading projection as `reading_select`, plus the owning user_id,
-        // filtered to readings whose mint is resolved (minted or denied).
+        // filtered to readings whose mint is resolved (minted, denied, or
+        // settled with no surplus to mint).
         let sql = format!(
             "SELECT user_id,
                     id,
@@ -212,6 +219,7 @@ impl MeterRepositoryTrait for MeterRepository {
              FROM meter_readings
              WHERE COALESCE(minted, false) OR COALESCE(on_chain_confirmed, false)
                 OR blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL
+                OR blockchain_status = 'no_surplus'
              ORDER BY timestamp DESC
              LIMIT $1"
         );
@@ -232,7 +240,8 @@ impl MeterRepositoryTrait for MeterRepository {
                 COUNT(*) FILTER (WHERE COALESCE(minted, false) OR COALESCE(on_chain_confirmed, false))::int8                         AS minted_count,
                 COUNT(*) FILTER (WHERE blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL)::int8                       AS denied_count,
                 COUNT(*) FILTER (WHERE NOT (COALESCE(minted, false) OR COALESCE(on_chain_confirmed, false))
-                                   AND NOT COALESCE(blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL, false))::int8 AS pending_count
+                                   AND NOT COALESCE(blockchain_status = 'failed' OR blockchain_last_error IS NOT NULL, false)
+                                   AND COALESCE(blockchain_status, '') != 'no_surplus')::int8 AS pending_count
              FROM meter_readings
              WHERE user_id = $1"
         );
