@@ -34,16 +34,22 @@ fn meter_select(filter: &str) -> String {
     format!(
         "SELECT m.id,
                 m.serial_number,
-                COALESCE(m.meter_type, 'smart_meter') AS meter_type,
-                COALESCE(m.location, '')              AS location,
-                COALESCE(m.is_verified, false)        AS is_verified,
-                COALESCE(u.wallet_address, '')        AS wallet_address,
+                COALESCE(m.meter_type, 'smart_meter')              AS meter_type,
+                COALESCE(m.location, '')                           AS location,
+                COALESCE(m.is_verified, false)                     AS is_verified,
+                COALESCE(u.wallet_address, uw.wallet_address, '')  AS wallet_address,
                 m.latitude, m.longitude, m.zone_id
          FROM meters m
          -- DB-per-service Phase 2: resolve the owner wallet from the local
          -- meter_owner_read_model (serial->wallet, fed by IAM+meter events) instead
          -- of the cross-domain IAM `users` table (absent from gridtokenx_meter).
          LEFT JOIN meter_owner_read_model u ON u.serial_number = m.serial_number
+         -- The serial->wallet row above is populated ASYNC (aggregator Kafka feed,
+         -- gated off by default), so it is empty the instant a meter is registered —
+         -- leaving a just-registered meter showing a blank wallet. Fall back to the
+         -- durable user->primary-wallet edge (written by IAM events regardless of
+         -- meter ownership), keyed by owner, so the wallet resolves immediately.
+         LEFT JOIN user_wallet_read_model uw ON uw.user_id = m.user_id
          WHERE {filter}"
     )
 }

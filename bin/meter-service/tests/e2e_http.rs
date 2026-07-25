@@ -304,6 +304,110 @@ async fn run_my_meters(app: &axum::Router, token: &str, serial: &str) -> Result<
     Ok(())
 }
 
+/// A freshly registered meter must surface the owner's wallet IMMEDIATELY —
+/// before the async aggregator read-model feed populates the serial→wallet row
+/// in `meter_owner_read_model` (it is empty the instant of registration, and the
+/// feed is gated off by default). `meter_select` falls back to the durable
+/// user→primary-wallet edge (`user_wallet_read_model`, written by IAM events
+/// regardless of meter ownership) keyed by `user_id`, so the wallet resolves at
+/// once. This pins that fallback: a user present ONLY in `user_wallet_read_model`
+/// (no serial row for the new meter) still gets a non-blank `wallet_address`.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn http_e2e_register_surfaces_wallet_from_user_edge() {
+    let db = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB.to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| DEFAULT_SECRET.to_string());
+
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&db)
+        .await
+        .expect("connect Postgres");
+
+    // Fresh user with NO meter_owner_read_model serial row anywhere — only the
+    // user→wallet edge. The fresh serial guarantees no serial-keyed row exists,
+    // so a resolved wallet can ONLY have come from the fallback JOIN.
+    let user_id = Uuid::new_v4();
+    let wallet = "E2EWa11etFromUserEdge1111111111111111111111";
+    sqlx::query(
+        "INSERT INTO user_wallet_read_model (user_id, wallet_address, updated_at)
+         VALUES ($1, $2, now())
+         ON CONFLICT (user_id) DO UPDATE SET wallet_address = EXCLUDED.wallet_address",
+    )
+    .bind(user_id)
+    .bind(wallet)
+    .execute(&pool)
+    .await
+    .expect("seed user_wallet_read_model");
+
+    let token = mint_jwt(user_id, &secret);
+    let serial = format!("E2E-WEDGE-{}", Uuid::new_v4());
+
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool.clone()));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(16);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret.as_str()),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let result = run_wallet_from_user_edge(&app, &token, &serial, wallet).await;
+
+    // Clean up regardless of outcome: the meter row + the seeded user edge.
+    cleanup(&pool, &serial).await;
+    let _ = sqlx::query("DELETE FROM user_wallet_read_model WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await;
+
+    result.expect("wallet-from-user-edge flow");
+}
+
+async fn run_wallet_from_user_edge(
+    app: &axum::Router,
+    token: &str,
+    serial: &str,
+    wallet: &str,
+) -> Result<(), String> {
+    macro_rules! check {
+        ($cond:expr, $($arg:tt)*) => {
+            if !$cond { return Err(format!($($arg)*)); }
+        };
+    }
+
+    register(app, token, serial).await?;
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/api/v1/me/meters", token, None))
+        .await
+        .expect("my meters");
+    check!(
+        resp.status() == StatusCode::OK,
+        "my-meters status {}",
+        resp.status()
+    );
+    let meters = json_body(resp).await;
+    let arr = meters.as_array().cloned().unwrap_or_default();
+    let mine = arr
+        .iter()
+        .find(|m| m["serial_number"] == serde_json::json!(serial));
+    check!(
+        mine.is_some(),
+        "registered meter {serial} absent from /me/meters: {meters}"
+    );
+    let mine = mine.expect("found");
+    check!(
+        mine["wallet_address"] == serde_json::json!(wallet),
+        "wallet not resolved from user edge: expected {wallet}, got {}",
+        mine["wallet_address"]
+    );
+
+    Ok(())
+}
+
 /// Error-contract paths through the real router + DB: duplicate serial → 409
 /// (the DB unique-constraint behavior, which has no unit coverage), and the
 /// removed ingest route (`POST /meters/{serial}/readings`) → 404.
