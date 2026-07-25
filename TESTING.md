@@ -16,11 +16,13 @@ cargo check                  # compile only, fast feedback
 cargo test                   # unit + infra-free router tests (DB-gated e2e is #[ignore], skipped)
 ```
 
-## CI gate (`.github/workflows/ci.yml`)
+## Pre-push gate (manual — there is no CI)
 
-Always-on, infra-free. **Hard gates**: `cargo fmt --all --check`,
+`.github/workflows/ci.yml` was deleted in `dbe96fc`; this repo has no `.github/`
+directory, so nothing runs automatically. Run these three yourself before pushing —
+they are still the bar: `cargo fmt --all --check`,
 `cargo clippy --all-targets -- -D warnings` (matches the repo `just clippy` bar), and
-`cargo test --workspace`. The `#[ignore]` DB suite is **not** run here
+`cargo test --workspace`. The `#[ignore]` DB suite is **not** part of that set
 (shared IAM-owned, partitioned schema) — it runs against a live stack (root e2e Tier-2 / manual).
 
 ## Unit tests — where they live

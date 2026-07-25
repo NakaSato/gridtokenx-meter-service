@@ -59,11 +59,14 @@ offline cache are needed to compile or run unit tests** — the DB is only touch
 Lints are strict (workspace `Cargo.toml`): `unsafe_code = deny`, `clippy::pedantic = warn`,
 `clippy::unwrap_used = deny`, `missing_docs = warn`. Don't introduce `.unwrap()`.
 
-**CI gate** (`.github/workflows/ci.yml`, always-on, infra-free). Hard gates:
-`cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and
-`cargo test --workspace`. Keep all green — pedantic warnings and unformatted code **fail** the
-build (run `cargo fmt` before pushing). The `#[ignore]` DB-gated e2e suite is **not** run in CI (shared
-IAM-owned, partitioned schema); it runs against a live stack — see [TESTING.md](TESTING.md).
+**There is no CI gate — run it yourself.** `.github/workflows/ci.yml` was deleted in
+`dbe96fc`, and this repo has no `.github/` directory. The bar it enforced is still the
+bar, but nothing checks it automatically: `cargo fmt --all --check`,
+`cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace`. Run all three
+before pushing — pedantic warnings and unformatted code are still failures by policy, you
+just won't be told by a robot. The `#[ignore]` DB-gated e2e suite is excluded from that
+set (shared IAM-owned, partitioned schema); it runs against a live stack — see
+[TESTING.md](TESTING.md).
 
 Coverage at a glance: `meter-logic` unit tests (page-clamp, stats per-zone flow, register
 validation, readiness), `meter-api` SSE-filter unit tests, two infra-free router
