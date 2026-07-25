@@ -21,7 +21,7 @@ COPY bin ./bin
 # Cache mounts: cargo registry + target persist across builds in BuildKit's
 # cache (incremental recompile). Copy the binary out before the RUN ends —
 # the mount is not visible to a later COPY.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target \
     cargo build --release --bin meter-service && \
     strip target/release/meter-service && \
