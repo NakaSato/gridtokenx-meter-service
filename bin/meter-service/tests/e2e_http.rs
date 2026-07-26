@@ -8,15 +8,18 @@
 //! directly (`inject_*`) the way other services write them. It also proves the
 //! read-only `mint_status` projection is wired through every read path.
 //!
-//! Self-contained: it picks an existing wallet-bearing user from the local
-//! `meter_owner_read_model` (the owner source of truth on this split DB — NOT
-//! `users`, which lives in `gridtokenx_iam` and isn't reachable from here; see
-//! `meters.user_id` having no FK, `meter-persistence/src/repository/meter.rs`),
-//! uses a unique throwaway serial, and deletes the meter + readings it created.
-//! It does NOT mutate the user it borrows.
+//! Self-contained: it picks an existing wallet-bearing user from
+//! `user_wallet_read_model` — the one table this service reads but does not own
+//! (IAM owns wallets; the aggregator's IAM-event feed is the sole writer; see
+//! `contracts/user_wallet_read_model.sql` and TD-004). It is NOT `users`, which
+//! lives in `gridtokenx_iam` and isn't reachable from here — hence `meters.user_id`
+//! having no FK. The fixtures deliberately do not touch `meter_owner_read_model`:
+//! that is the aggregator's private serial-keyed projection and this service must
+//! keep resolving owners without it. Each test uses a unique throwaway serial and
+//! deletes the meter + readings it created; it does NOT mutate the user it borrows.
 //!
-//! Ignored by default (needs live Postgres, with `meter_owner_read_model`
-//! populated by IAM/meter events — e.g. via the running docker stack). Run:
+//! Ignored by default (needs live Postgres, with `user_wallet_read_model`
+//! populated by IAM events — e.g. via the running docker stack). Run:
 //!
 //! ```text
 //! DATABASE_URL=postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx_meter \
@@ -113,7 +116,7 @@ async fn http_e2e_register_and_read() {
     // Borrow an existing wallet-bearing user from the local owner read-model
     // (this DB has no `users` table post-split; `meters.user_id` carries no FK).
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -245,7 +248,7 @@ async fn http_e2e_my_meters() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -304,14 +307,17 @@ async fn run_my_meters(app: &axum::Router, token: &str, serial: &str) -> Result<
     Ok(())
 }
 
-/// A freshly registered meter must surface the owner's wallet IMMEDIATELY —
-/// before the async aggregator read-model feed populates the serial→wallet row
-/// in `meter_owner_read_model` (it is empty the instant of registration, and the
-/// feed is gated off by default). `meter_select` falls back to the durable
-/// user→primary-wallet edge (`user_wallet_read_model`, written by IAM events
-/// regardless of meter ownership) keyed by `user_id`, so the wallet resolves at
-/// once. This pins that fallback: a user present ONLY in `user_wallet_read_model`
-/// (no serial row for the new meter) still gets a non-blank `wallet_address`.
+/// A freshly registered meter must surface the owner's wallet IMMEDIATELY, with
+/// no dependency on the aggregator's serial-keyed projection.
+///
+/// This started life as a test of a *fallback* (`c6aa96b`): `meter_select` joined
+/// `meter_owner_read_model` first and only consulted the user edge when the async
+/// feed had not yet written the serial row. TD-004 removed that first join —
+/// meter-service now resolves owner wallets through `user_wallet_read_model`
+/// alone, keyed on the locally-owned `meters.user_id` — so this is no longer a
+/// fallback path but THE path. It still pins the same observable: a user present
+/// only in `user_wallet_read_model`, with no serial row anywhere, gets a
+/// non-blank `wallet_address` the instant the meter is registered.
 #[tokio::test]
 #[ignore = "requires live Postgres"]
 async fn http_e2e_register_surfaces_wallet_from_user_edge() {
@@ -325,9 +331,9 @@ async fn http_e2e_register_surfaces_wallet_from_user_edge() {
         .await
         .expect("connect Postgres");
 
-    // Fresh user with NO meter_owner_read_model serial row anywhere — only the
-    // user→wallet edge. The fresh serial guarantees no serial-keyed row exists,
-    // so a resolved wallet can ONLY have come from the fallback JOIN.
+    // Fresh user with only the user→wallet edge, and a fresh serial that has no
+    // row in the aggregator's serial-keyed projection — so a resolved wallet can
+    // only have come from `user_wallet_read_model` via `meters.user_id`.
     let user_id = Uuid::new_v4();
     let wallet = "E2EWa11etFromUserEdge1111111111111111111111";
     sqlx::query(
@@ -425,7 +431,7 @@ async fn http_e2e_error_paths() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -630,7 +636,7 @@ async fn http_e2e_multi_user_isolation() {
 
     // Need two DISTINCT wallet-bearing users.
     let users: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 2",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 2",
     )
     .fetch_all(&pool)
     .await
@@ -882,7 +888,7 @@ async fn http_e2e_mint_status_minted_and_denied() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -1052,7 +1058,7 @@ async fn http_e2e_mint_status_not_applicable() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -1173,7 +1179,7 @@ async fn http_e2e_pagination() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -1280,7 +1286,7 @@ async fn http_e2e_reading_fields_and_aggregates() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -1701,7 +1707,7 @@ async fn readings_headers_report_pagination() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -1842,7 +1848,7 @@ async fn http_e2e_mint_status_alt_predicates_and_precedence() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -1982,7 +1988,7 @@ async fn http_e2e_list_ordering_and_last_reading_time() {
         .await
         .expect("connect Postgres");
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -2086,7 +2092,7 @@ async fn http_e2e_register_persists_lat_lon() {
         .await
         .expect("connect Postgres");
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -2174,7 +2180,7 @@ async fn http_e2e_stats_per_zone_net_flow() {
         .await
         .expect("connect Postgres");
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await
@@ -2422,7 +2428,7 @@ async fn http_e2e_mint_poller_pushes_transition_to_sse() {
         .expect("connect Postgres");
 
     let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM meter_owner_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
+        "SELECT user_id FROM user_wallet_read_model WHERE wallet_address IS NOT NULL AND wallet_address <> '' LIMIT 1",
     )
     .fetch_optional(&pool)
     .await

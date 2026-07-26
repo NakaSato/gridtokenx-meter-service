@@ -37,18 +37,25 @@ fn meter_select(filter: &str) -> String {
                 COALESCE(m.meter_type, 'smart_meter')              AS meter_type,
                 COALESCE(m.location, '')                           AS location,
                 COALESCE(m.is_verified, false)                     AS is_verified,
-                COALESCE(u.wallet_address, uw.wallet_address, '')  AS wallet_address,
+                COALESCE(uw.wallet_address, '')                     AS wallet_address,
                 m.latitude, m.longitude, m.zone_id
          FROM meters m
-         -- DB-per-service Phase 2: resolve the owner wallet from the local
-         -- meter_owner_read_model (serial->wallet, fed by IAM+meter events) instead
-         -- of the cross-domain IAM `users` table (absent from gridtokenx_meter).
-         LEFT JOIN meter_owner_read_model u ON u.serial_number = m.serial_number
-         -- The serial->wallet row above is populated ASYNC (aggregator Kafka feed,
-         -- gated off by default), so it is empty the instant a meter is registered —
-         -- leaving a just-registered meter showing a blank wallet. Fall back to the
-         -- durable user->primary-wallet edge (written by IAM events regardless of
-         -- meter ownership), keyed by owner, so the wallet resolves immediately.
+         -- DB-per-service Phase 2: the owner wallet comes from the durable
+         -- user->primary-wallet edge, keyed on the LOCALLY-OWNED `meters.user_id`.
+         --
+         -- This deliberately does NOT join `meter_owner_read_model`. That table is
+         -- the AGGREGATOR's private serial->(user, wallet) projection, which it
+         -- builds by consuming the very `MeterRegistered` events this service
+         -- emits — so reading it here is circular: meter-service asking another
+         -- service for a re-derivation of its own `meters.user_id`. It is also
+         -- fed ASYNC, so it is empty at the instant of registration and blanked a
+         -- just-registered meter's wallet (the reason the user-edge fallback was
+         -- added in c6aa96b). Keying on the local user_id removes both problems.
+         --
+         -- `user_wallet_read_model` is the one genuinely foreign fact left: IAM
+         -- owns wallets. It is a metering-context SHARED contract table (written
+         -- solely by the aggregator's IAM-event feed, read by both services) —
+         -- see migrations/0001_meter_registry.sql and TD-004.
          LEFT JOIN user_wallet_read_model uw ON uw.user_id = m.user_id
          WHERE {filter}"
     )
@@ -145,13 +152,17 @@ impl MeterRepositoryTrait for MeterRepository {
                           COALESCE(m.meter_type, 'smart_meter') AS meter_type,
                           COALESCE(m.location, '')              AS location,
                           COALESCE(m.is_verified, false)        AS is_verified,
-                          COALESCE(u.wallet_address, '')        AS wallet_address,
+                          COALESCE(uw.wallet_address, '')       AS wallet_address,
                           m.latitude::float8                    AS latitude,
                           m.longitude::float8                   AS longitude,
                           m.zone_id
                    FROM meters m
-                   -- DB-per-service Phase 2: owner wallet from local read-model, not IAM `users`.
-                   LEFT JOIN meter_owner_read_model u ON u.serial_number = m.serial_number
+                   -- Same owner join as `meter_select`: the user->wallet edge keyed
+                   -- on the locally-owned m.user_id, never the aggregator's
+                   -- serial-keyed projection. This site previously had NO fallback,
+                   -- so a meter whose serial row had not yet been fed showed a blank
+                   -- wallet on the map even when the owner's wallet was known.
+                   LEFT JOIN user_wallet_read_model uw ON uw.user_id = m.user_id
                    WHERE m.latitude IS NOT NULL AND m.longitude IS NOT NULL
                    ORDER BY m.created_at DESC";
         let points = sqlx::query_as::<_, MeterMapPoint>(sql)

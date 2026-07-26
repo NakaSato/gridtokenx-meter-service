@@ -12,11 +12,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this service is
 
 `gridtokenx-meter-service` — a small Axum service backing the trading UI's Smart Meter
-dashboard. It owns no schema of its own: it reads the **shared `gridtokenx` Postgres**
-(`meters`, `meter_readings`, joined to `users` for the wallet). It does **no blockchain work** —
+dashboard. It runs against the split **`gridtokenx_meter`** Postgres, where it is the sole writer
+of `meters`/`meter_registry`/`meter_verification_attempts` (see [Critical invariants](#critical-invariants))
+and reads `meter_readings` (written by the Aggregator Bridge). It does **no blockchain work** —
 no minting, no Chain Bridge, no NATS, no Solana. It is a **read-mostly** meter registry + reading
 **reader** with a realtime push stream. It *reads* the table's mint columns read-only to surface a
 `mint_status` (`minted`/`pending`/`denied`) for the dashboard, but never writes them.
+
+> **Owner wallets come from ONE table this service does not own** — `user_wallet_read_model`
+> (user → primary wallet; IAM owns wallets, the aggregator's IAM-event feed is the sole writer).
+> Both read sites join it on the **locally-owned** `meters.user_id`
+> (`crates/meter-persistence/src/repository/meter.rs`). It deliberately does **not** read
+> `meter_owner_read_model`: that is the aggregator's private serial→(user, wallet) projection, built
+> by consuming the very `MeterRegistered` events this service emits, so reading it would be circular
+> (and async-lagged, blanking a just-registered meter's wallet). Do not re-add that join. The
+> contract's DDL is mirrored at `contracts/user_wallet_read_model.sql` and drift-guarded by the
+> superproject's `just check-ddl-sync`; see TD-004 in `../docs/exec-plans/tech-debt-tracker.md`.
 
 > **Reading ingest is NOT here.** Meter telemetry is ingested **only** via the Aggregator Bridge
 > (Ed25519-signed IoT gateway → zone Redis Streams / InfluxDB / Kafka). This service does **not**
@@ -147,7 +158,7 @@ Domain field names mirror the trading UI contract (`types/meter.ts`) — keep th
 | Var | Default | Purpose |
 | --- | --- | --- |
 | `JWT_SECRET` | — (**required**) | HS256 secret; must equal the value IAM signs tokens with. |
-| `DATABASE_URL` | `…@postgres:5432/gridtokenx` | Shared `gridtokenx` Postgres. |
+| `DATABASE_URL` | `…@postgres:5432/gridtokenx` | Postgres. The code default still names the pre-split shared DB; compose points it at the split `gridtokenx_meter` (`docker-compose.yml:605`), which is what this service actually runs against. |
 | `METER_SERVICE_PORT` / `PORT` | `8080` | Bind port (binds `0.0.0.0`). |
 | `METER_MINT_POLL_SECS` | `15` | Mint-status SSE poller interval; `0` disables it. |
 
