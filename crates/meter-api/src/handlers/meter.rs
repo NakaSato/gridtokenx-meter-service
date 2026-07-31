@@ -59,7 +59,8 @@ fn default_limit() -> i64 {
     50
 }
 
-/// GET /api/v1/meters/readings?limit&offset
+/// GET /api/v1/me/meters/readings?limit&offset
+/// (legacy alias: GET /api/v1/meters/readings)
 ///
 /// The body stays a JSON array of readings (unchanged contract). Pagination
 /// metadata rides in response headers: `X-Total-Count` (total readings for the
@@ -89,7 +90,7 @@ pub async fn get_my_readings(
     Ok((headers, Json(readings)))
 }
 
-/// GET /api/v1/meters/stats
+/// GET /api/v1/me/meters/stats (legacy alias: GET /api/v1/meters/stats)
 ///
 /// # Errors
 /// Returns an error if the query fails.
@@ -101,7 +102,8 @@ pub async fn get_meter_stats(
     Ok(Json(meter_stats))
 }
 
-/// POST /api/v1/meters — register a meter for the authenticated user.
+/// POST /api/v1/me/meters — register a meter for the authenticated user.
+/// (legacy alias: POST /api/v1/meters)
 ///
 /// # Errors
 /// Returns an error on invalid input, duplicate serial, or query failure.
@@ -117,7 +119,8 @@ pub async fn register_meter(
     Ok(Json(resp))
 }
 
-/// GET /api/v1/meters/readings/stream — realtime reading stream (SSE).
+/// GET /api/v1/me/meters/readings/stream — realtime reading stream (SSE).
+/// (legacy alias: GET /api/v1/meters/readings/stream)
 ///
 /// Subscribes to the broadcast channel and emits the authenticated user's
 /// readings as `data:` events as they are submitted. Lagged events (slow

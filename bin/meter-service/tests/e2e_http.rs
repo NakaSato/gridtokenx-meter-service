@@ -1612,6 +1612,143 @@ async fn db_error_maps_to_500() {
     );
 }
 
+/// Route unification: every caller-scoped route is reachable on the canonical
+/// `/api/v1/me/meters*` base, and each legacy `/api/v1/meters*` path is still
+/// dual-served by the *same* handler.
+///
+/// Infra-free — drives a pool at a closed port, so what's asserted is purely
+/// which handler the router picked, not what the DB said:
+///   * neither path may 404 (route missing) or 405 (method not allowed);
+///   * both paths in a pair must return the identical status, which is what
+///     "same handler" looks like from outside (a DB read → 500, SSE → 200, a
+///     malformed register body rejected by the `Json` extractor → 400).
+/// A drift on either base — dropping an alias, hanging a new path off the wrong
+/// prefix — flips one side of a pair and fails here.
+#[tokio::test]
+async fn route_bases_me_and_legacy_reach_same_handlers() {
+    let secret = "test-secret-minimum-32-characters-long-aaaaaaaaaa";
+    let pool = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(2))
+        .connect_lazy("postgresql://nobody@127.0.0.1:1/nodb")
+        .expect("lazy pool");
+    let repo: Arc<dyn MeterRepositoryTrait> = Arc::new(MeterRepository::new(pool));
+    let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(4);
+    let state = AppState {
+        meter_service: MeterService::new(repo),
+        jwt_secret: Arc::from(secret),
+        readings_tx,
+    };
+    let app = build_app(state);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_secs();
+    let token = mint_jwt_with_exp(Uuid::new_v4(), secret, now + 3600);
+
+    assert_alias_pairs(&app, &token).await;
+    assert_unpaired_routes(&app, &token).await;
+}
+
+/// Each canonical `/me/meters*` route and its legacy `/meters*` alias must be
+/// routed, accept the method, and return the identical status.
+async fn assert_alias_pairs(app: &axum::Router, token: &str) {
+    // (method, canonical path, legacy alias, body) — the body is deliberately
+    // malformed JSON for the register pair so the request is decided by the
+    // extractor rather than the dead DB.
+    let pairs: &[(&str, &str, &str, Option<&str>)] = &[
+        (
+            "POST",
+            "/api/v1/me/meters",
+            "/api/v1/meters",
+            Some("{ this is not json"),
+        ),
+        (
+            "GET",
+            "/api/v1/me/meters/readings",
+            "/api/v1/meters/readings",
+            None,
+        ),
+        (
+            "GET",
+            "/api/v1/me/meters/readings/stream",
+            "/api/v1/meters/readings/stream",
+            None,
+        ),
+        (
+            "GET",
+            "/api/v1/me/meters/stats",
+            "/api/v1/meters/stats",
+            None,
+        ),
+    ];
+
+    for (method, canonical, legacy, raw_body) in pairs {
+        let mut statuses = Vec::new();
+        for uri in [canonical, legacy] {
+            let req = match raw_body {
+                Some(raw) => Request::builder()
+                    .method(*method)
+                    .uri(*uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(*raw))
+                    .expect("req"),
+                None => authed(method, uri, token, None),
+            };
+            let status = app.clone().oneshot(req).await.expect("oneshot").status();
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{method} {uri} is not routed (404)"
+            );
+            assert_ne!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {uri} rejects the method (405)"
+            );
+            statuses.push(status);
+        }
+        assert_eq!(
+            statuses[0], statuses[1],
+            "{method} {canonical} and {legacy} must hit the same handler, \
+             got {} vs {}",
+            statuses[0], statuses[1]
+        );
+    }
+}
+
+/// The two routes with no alias pair: the already-canonical meter list, and the
+/// grid-wide map that must stay OFF the caller-scoped `/me` base.
+async fn assert_unpaired_routes(app: &axum::Router, token: &str) {
+    for uri in ["/api/v1/me/meters", "/api/v1/meters/map"] {
+        let status = app
+            .clone()
+            .oneshot(authed("GET", uri, token, None))
+            .await
+            .expect("oneshot")
+            .status();
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "GET {uri} should reach its handler and fail at the dead DB, got {status}"
+        );
+    }
+
+    // The map is grid-wide by design: it must NOT be reachable under `/me`.
+    let status = app
+        .clone()
+        .oneshot(authed("GET", "/api/v1/me/meters/map", token, None))
+        .await
+        .expect("oneshot")
+        .status();
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the grid-wide map must not be exposed on the caller-scoped /me base"
+    );
+}
+
 /// Readiness: `GET /health/ready` returns 503 when Postgres is unreachable.
 /// No auth required; drives a lazy pool at a closed port so the ping fails fast.
 /// (The 200 path needs a live DB and is exercised by the DB-gated flow tests.)

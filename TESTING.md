@@ -72,15 +72,19 @@ so they never perturb other tests' SUM-aggregate deltas under parallel runs.
 | --- | --- |
 | `http_e2e_register_and_read` | Register → inject a pending reading (as the Aggregator Bridge would write it) → list shows it `pending` → stats `pending_count >= 1`. |
 | `http_e2e_mint_status_minted_and_denied` | **minted + denied** branches: inject one minted (tx sig) + one denied (`blockchain_status='failed'`) row, assert list `mint_status` + `mint_tx_signature` and stats `minted_count` / `denied_count`. |
-| `http_e2e_my_meters` | Registered meter appears in `GET /me/meters`. |
+| `http_e2e_my_meters` | Registered meter appears in `GET /api/v1/me/meters`. |
 | `http_e2e_error_paths` | Duplicate serial → 409; the removed reading-ingest route `POST /api/v1/meters/{serial}/readings` → 404. |
 | `http_e2e_multi_user_isolation` | List scoping: each user sees only their own injected readings (B's never appears in A's list). |
 | `http_e2e_reading_fields_and_aggregates` | Optional energy fields project through; stats SUMs move by exact injected delta. |
 | `http_e2e_pagination` | `limit` page cap, over-max clamp, negative offset clamp. |
 
-Two more tests in the same file are **infra-free** (lazy pool, no live DB, run with `cargo test`):
-`auth_rejects_bad_tokens` (missing / garbage / wrong-sig / expired JWT → 401) and
-`malformed_body_and_unknown_route` (malformed JSON → 400, unknown route → 404).
+More tests in the same file are **infra-free** (lazy pool, no live DB, run with `cargo test`):
+`auth_rejects_bad_tokens` (missing / garbage / wrong-sig / expired JWT → 401),
+`malformed_body_and_unknown_route` (malformed JSON → 400, unknown route → 404), and
+`route_bases_me_and_legacy_reach_same_handlers` — the route-unification guard: every caller-scoped
+route answers on the canonical `/api/v1/me/meters*` base, each legacy `/api/v1/meters*` alias is
+still dual-served by the *same* handler (identical status, never 404/405), and the grid-wide
+`/api/v1/meters/map` is **not** reachable under `/me`.
 
 ```bash
 DATABASE_URL=postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx \
@@ -100,7 +104,7 @@ The e2e test above covers SSE end-to-end. For an ad-hoc live smoke-test of a run
 ```bash
 # Terminal 1 — subscribe to the stream
 curl -N -H "Authorization: Bearer <jwt>" \
-  http://localhost:8080/api/v1/meters/readings/stream
+  http://localhost:8080/api/v1/me/meters/readings/stream
 
 # Terminal 2 — submit a reading for the same user's meter; it should appear in terminal 1
 curl -X POST -H "Authorization: Bearer <jwt>" -H 'content-type: application/json' \

@@ -34,16 +34,25 @@ Dependency direction (never reverse):
 
 ## Routes
 
+Every caller-scoped route is canonical under the platform's `/api/v1/me` user-self base:
+
 ```
 GET  /health
 GET  /health/ready
-GET  /api/v1/me/meters
-GET  /api/v1/meters/map
-POST /api/v1/meters                              # register
-GET  /api/v1/meters/readings?limit&offset
-GET  /api/v1/meters/readings/stream              # SSE (mint-status transitions)
-GET  /api/v1/meters/stats
+GET  /metrics                                    # internal CIDRs only (APISIX-gated)
+GET  /api/v1/me/meters                           # the caller's meters
+POST /api/v1/me/meters                           # register
+GET  /api/v1/me/meters/readings?limit&offset
+GET  /api/v1/me/meters/readings/stream           # SSE (mint-status transitions)
+GET  /api/v1/me/meters/stats
+GET  /api/v1/meters/map                          # grid-wide — NOT caller-scoped
 ```
+
+**Legacy aliases, still dual-served** by the identical handlers, so existing clients keep working:
+`POST /api/v1/meters` · `GET /api/v1/meters/readings` · `GET /api/v1/meters/readings/stream` ·
+`GET /api/v1/meters/stats`. Prefer the `/api/v1/me/meters*` forms in new code; the aliases go away
+once no caller uses them. `GET /api/v1/meters/map` is *not* an alias — it is grid-wide by design
+(every located meter across all users) and deliberately stays off the `/me` base.
 
 There is **no** reading-ingest route and **no** mint route. Domain field names mirror the trading UI
 contract (`types/meter.ts`) — keep them in sync.

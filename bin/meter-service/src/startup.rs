@@ -113,8 +113,30 @@ pub fn build_app(state: AppState) -> Router {
         .route("/health", get(system::health))
         .route("/health/ready", get(system::ready))
         .route("/metrics", get(metrics_handler))
-        .route("/api/v1/me/meters", get(meter::get_my_meters))
+        // ---- Canonical surface: caller-scoped routes live under `/api/v1/me` ----
+        // Every route below is scoped to the JWT `sub`, so the path says so. This
+        // matches the platform user-self convention (IAM `/me/wallets`, Trading
+        // `/me/orders`, Noti `/me/notifications`); APISIX route 12 carries
+        // priority 20 so `/api/v1/me/meters*` reaches this service rather than
+        // being swallowed by IAM's `/api/v1/me/*` route 11.
+        .route(
+            "/api/v1/me/meters",
+            get(meter::get_my_meters).post(meter::register_meter),
+        )
+        .route("/api/v1/me/meters/readings", get(meter::get_my_readings))
+        .route(
+            "/api/v1/me/meters/readings/stream",
+            get(meter::stream_readings),
+        )
+        .route("/api/v1/me/meters/stats", get(meter::get_meter_stats))
+        // Grid-wide, deliberately NOT caller-scoped (the map shows every located
+        // meter across all users) — so it stays off the `/me` base.
         .route("/api/v1/meters/map", get(meter::get_meters_map))
+        // ---- Legacy aliases (dual-served, same handlers) ----
+        // Pre-unification paths, kept so the Trading UI and any live client keep
+        // working while callers migrate to the `/api/v1/me/meters*` forms above.
+        // Remove only once no caller hits them; each maps to the identical
+        // handler, so behavior is byte-for-byte the same on either path.
         .route("/api/v1/meters", post(meter::register_meter))
         .route("/api/v1/meters/readings", get(meter::get_my_readings))
         .route(

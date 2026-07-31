@@ -37,10 +37,10 @@ no minting, no Chain Bridge, no NATS, no Solana. It is a **read-mostly** meter r
 
 Responsibilities:
 
-1. **Register a meter to a user account** — `POST /api/v1/meters`, scoped to the JWT user.
+1. **Register a meter to a user account** — `POST /api/v1/me/meters`, scoped to the JWT user.
 2. **Serve readings/stats** — list + aggregate endpoints for the dashboard, each carrying a
    read-only `mint_status` (and `minted`/`pending`/`denied` counts in stats).
-3. **Realtime stream** — `GET /api/v1/meters/readings/stream` (Server-Sent Events): mint-status
+3. **Realtime stream** — `GET /api/v1/me/meters/readings/stream` (Server-Sent Events): mint-status
    transitions (`pending → minted`/`denied`), detected by the background poller, are fanned out
    to that user's open SSE subscribers.
 
@@ -105,9 +105,24 @@ Traits defined in `meter-core/src/traits.rs`, implemented in `meter-persistence`
 
 ### Routes (`startup.rs`)
 `GET /health` (liveness) · `GET /health/ready` (readiness — `200`/`503` on a Postgres ping) ·
-`GET /api/v1/me/meters` · `POST /api/v1/meters` (register) ·
-`GET /api/v1/meters/readings?limit&offset` · `GET /api/v1/meters/readings/stream` (SSE) ·
-`GET /api/v1/meters/stats`. (No reading-ingest route — readings arrive via the Aggregator Bridge.)
+`GET /metrics` (Prometheus; APISIX-gated to internal CIDRs).
+
+**Caller-scoped routes are canonical under `/api/v1/me`** — the platform user-self base, matching
+IAM `/me/wallets`, Trading `/me/orders`, Noti `/me/notifications`:
+`GET /api/v1/me/meters` · `POST /api/v1/me/meters` (register) ·
+`GET /api/v1/me/meters/readings?limit&offset` · `GET /api/v1/me/meters/readings/stream` (SSE) ·
+`GET /api/v1/me/meters/stats`.
+
+`GET /api/v1/meters/map` stays **off** the `/me` base on purpose: it is grid-wide (every located
+meter across all users), not caller-scoped, and must not be reachable at `/api/v1/me/meters/map`.
+
+The pre-unification paths — `POST /api/v1/meters`, `GET /api/v1/meters/{readings,readings/stream,stats}`
+— are **dual-served legacy aliases** bound to the identical handlers, so existing clients (the
+Trading UI, the e2e suites) keep working during migration. Prefer the `/me` forms in new code; drop
+an alias only when no caller hits it. `route_bases_me_and_legacy_reach_same_handlers`
+(`bin/meter-service/tests/e2e_http.rs`) pins both bases and fails if either side drifts.
+
+(No reading-ingest route — readings arrive via the Aggregator Bridge.)
 
 Domain field names mirror the trading UI contract (`types/meter.ts`) — keep them in sync.
 
