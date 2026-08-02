@@ -104,7 +104,9 @@ pub fn spawn(service: MeterService, tx: broadcast::Sender<Arc<ReadingEvent>>, in
 mod tests {
     use super::*;
 
-    use meter_core::domain::meter::{Meter, MeterMapPoint, MeterStats, RegisterMeterRequest};
+    use meter_core::domain::meter::{
+        Meter, MeterMapPoint, MeterStats, MeterVerificationAttempt, RegisterMeterRequest,
+    };
     use meter_core::error::Result;
     use meter_core::traits::MeterRepositoryTrait;
 
@@ -155,6 +157,27 @@ mod tests {
         }
         async fn count_user_readings(&self, _user_id: Uuid) -> Result<i64> {
             Ok(0)
+        }
+        async fn count_attested_readings(
+            &self,
+            _user_id: Uuid,
+            _serial: &str,
+            _within_hours: i64,
+        ) -> Result<i64> {
+            Ok(0)
+        }
+        async fn mark_meter_verified(
+            &self,
+            _user_id: Uuid,
+            _serial: &str,
+        ) -> Result<Option<Meter>> {
+            unreachable!("disabled poller never verifies")
+        }
+        async fn record_verification_attempt(
+            &self,
+            _attempt: &MeterVerificationAttempt,
+        ) -> Result<()> {
+            unreachable!("disabled poller never verifies")
         }
         async fn list_resolved_mint_readings(
             &self,

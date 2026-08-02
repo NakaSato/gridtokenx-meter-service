@@ -38,9 +38,14 @@ no minting, no Chain Bridge, no NATS, no Solana. It is a **read-mostly** meter r
 Responsibilities:
 
 1. **Register a meter to a user account** — `POST /api/v1/me/meters`, scoped to the JWT user.
-2. **Serve readings/stats** — list + aggregate endpoints for the dashboard, each carrying a
+   Registration only **claims** a serial: the row lands `is_verified = false`.
+2. **Verify a meter** — `POST /api/v1/me/meters/{serial}/verify`. Proves possession by
+   **telemetry attestation** (see [Critical invariants](#critical-invariants)) and flips
+   `is_verified`, emitting `MeterUpdated`. **Trading refuses a sell order (403) from a user
+   with no verified meter**, so this is the gate between owning a meter and selling energy.
+3. **Serve readings/stats** — list + aggregate endpoints for the dashboard, each carrying a
    read-only `mint_status` (and `minted`/`pending`/`denied` counts in stats).
-3. **Realtime stream** — `GET /api/v1/me/meters/readings/stream` (Server-Sent Events): mint-status
+4. **Realtime stream** — `GET /api/v1/me/meters/readings/stream` (Server-Sent Events): mint-status
    transitions (`pending → minted`/`denied`), detected by the background poller, are fanned out
    to that user's open SSE subscribers.
 
@@ -111,12 +116,16 @@ Traits defined in `meter-core/src/traits.rs`, implemented in `meter-persistence`
 IAM `/me/wallets`, Trading `/me/orders`, Noti `/me/notifications`:
 `GET /api/v1/me/meters` · `POST /api/v1/me/meters` (register) ·
 `GET /api/v1/me/meters/readings?limit&offset` · `GET /api/v1/me/meters/readings/stream` (SSE) ·
-`GET /api/v1/me/meters/stats`.
+`GET /api/v1/me/meters/stats` · `POST /api/v1/me/meters/{serial}/verify`.
+
+The `{serial}` segment does not collide with the static `readings`/`stats` routes: those sit one
+segment past `meters`, the verify route two.
 
 `GET /api/v1/meters/map` stays **off** the `/me` base on purpose: it is grid-wide (every located
 meter across all users), not caller-scoped, and must not be reachable at `/api/v1/me/meters/map`.
 
-The pre-unification paths — `POST /api/v1/meters`, `GET /api/v1/meters/{readings,readings/stream,stats}`
+The pre-unification paths — `POST /api/v1/meters`, `POST /api/v1/meters/{serial}/verify`,
+`GET /api/v1/meters/{readings,readings/stream,stats}`
 — are **dual-served legacy aliases** bound to the identical handlers, so existing clients (the
 Trading UI, the e2e suites) keep working during migration. Prefer the `/me` forms in new code; drop
 an alias only when no caller hits it. `route_bases_me_and_legacy_reach_same_handlers`
@@ -131,6 +140,26 @@ Domain field names mirror the trading UI contract (`types/meter.ts`) — keep th
 ## Critical invariants
 
 - **`JWT_SECRET` is the only hard-required config.** Everything else has a default.
+- **Registration claims; verification proves — and Trading enforces the difference.**
+  `register_meter` inserts `is_verified = false` (`meter-persistence/src/repository/meter.rs`).
+  It used to insert `true` on the reasoning that the device streams signed telemetry anyway;
+  that conflated "will eventually be provable" with "has been proven", made the flag a
+  constant, and left the trading sell-side gate that reads it vacuous.
+  `POST /api/v1/me/meters/{serial}/verify` (`MeterService::verify_meter`) is the proof step:
+  it passes when at least one row in `meter_readings` for that `(user_id, serial)` carries
+  `verification_status = 'verified'` inside `METER_VERIFY_WINDOW_HOURS` (default 720).
+  That column is written **only** by the Aggregator Bridge's batch insert, and only for frames
+  whose Ed25519 signature it accepted against the device key provisioned for that serial — so
+  it attests the physical device, not the HTTP session. **The attestation is exactly as strong
+  as the bridge's ingest policy:** the bridge honours `SKIP_SIG_VERIFY` and
+  `AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY`, which stamp `'verified'` without checking anything.
+  Ownership is enforced by the owner-scoped UPDATE, so this can never verify another user's
+  meter; another user's serial 404s exactly like a nonexistent one, on purpose (a distinct
+  403 would turn the endpoint into an oracle for which serials are registered).
+  The flip is a **one-way latch** — a meter going quiet never un-verifies, because letting a
+  network outage strand a prosumer's open orders is worse than the risk it addresses.
+  Every decision, pass or fail, appends to `meter_verification_attempts`; that write is
+  best-effort (a failed audit must not tell an owner their verified meter is unverified).
 - **No reading-ingest path.** This service does not write `meter_readings` (no submit endpoint, no
   repository insert). Telemetry is ingested by the Aggregator Bridge; the only writes the broadcast
   channel carries are mint-status transitions from the background poller (below).
@@ -176,5 +205,6 @@ Domain field names mirror the trading UI contract (`types/meter.ts`) — keep th
 | `DATABASE_URL` | `…@postgres:5432/gridtokenx` | Postgres. The code default still names the pre-split shared DB; compose points it at the split `gridtokenx_meter` (`docker-compose.yml:605`), which is what this service actually runs against. |
 | `METER_SERVICE_PORT` / `PORT` | `8080` | Bind port (binds `0.0.0.0`). |
 | `METER_MINT_POLL_SECS` | `15` | Mint-status SSE poller interval; `0` disables it. |
+| `METER_VERIFY_WINDOW_HOURS` | `720` | How far back meter verification looks for attested telemetry. Unlike the poller interval, `0` does **not** disable — it clamps to 1, since a zero window would make every verification unsatisfiable and blame the device for it. |
 
 Dockerfile: multi-stage `rust:1-bookworm` → `debian:bookworm-slim`, exposes `8080`, healthcheck on `/health`.

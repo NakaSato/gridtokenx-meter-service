@@ -1256,6 +1256,7 @@ dependencies = [
  "async-trait",
  "meter-core",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

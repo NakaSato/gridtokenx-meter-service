@@ -1,7 +1,7 @@
 //! Meter domain events emitted on registry mutations.
 //!
-//! On a successful meter registration (and, if one is ever added, update) the
-//! service publishes a [`MeterEvent`] to Kafka. Downstream **read-models** (the
+//! On a successful meter registration or verification the service publishes a
+//! [`MeterEvent`] to Kafka. Downstream **read-models** (the
 //! trading service and the aggregator bridge) consume these to keep their own
 //! projections of the meter registry in sync without querying this service.
 //!
@@ -20,7 +20,8 @@ pub const EVENT_SOURCE: &str = "gridtokenx-meter-service";
 /// Event type for a newly registered meter.
 pub const EVENT_METER_REGISTERED: &str = "MeterRegistered";
 
-/// Event type for an updated meter (reserved — no update path exists today).
+/// Event type for an updated meter. Emitted by `MeterService::verify_meter` on
+/// the unverified → verified transition.
 pub const EVENT_METER_UPDATED: &str = "MeterUpdated";
 
 /// A meter domain event, serialized to JSON for Kafka.
@@ -57,6 +58,12 @@ pub struct MeterEventData {
     pub zone_id: Option<i32>,
     /// Coarse status derived from verification state (`verified` / `unverified`).
     pub status: String,
+    /// Verification state, unambiguously. Additive since the sell-side gate
+    /// landed: `status` is a *derived* string that consumers were left to parse,
+    /// and the trading read-model's own `status` column carries an unrelated
+    /// operating status (`active`), so the two collide. New consumers read this;
+    /// `status` stays for the ones already deployed.
+    pub is_verified: bool,
     /// Owner's wallet address, or `null` when unknown.
     pub wallet_address: Option<String>,
 }
@@ -65,16 +72,19 @@ impl MeterEvent {
     /// Builds a `MeterRegistered` event from a freshly persisted [`Meter`].
     ///
     /// `wallet_address` collapses the persistence layer's empty-string "no
-    /// wallet" sentinel to `None`; `status` is derived from `is_verified`
-    /// (registration verifies at insert, so this is normally `verified`).
+    /// wallet" sentinel to `None`; `status` is derived from `is_verified`.
+    /// Registration no longer verifies at insert, so this is normally
+    /// `unverified` — the `verified` transition arrives as a `MeterUpdated`
+    /// event from `MeterService::verify_meter`.
     #[must_use]
     pub fn meter_registered(user_id: Uuid, meter: &Meter) -> Self {
         Self::from_meter(EVENT_METER_REGISTERED, user_id, meter)
     }
 
-    /// Builds a `MeterUpdated` event from a persisted [`Meter`]. Reserved for a
-    /// future update path; kept alongside [`Self::meter_registered`] so the two
-    /// stay wire-identical.
+    /// Builds a `MeterUpdated` event from a persisted [`Meter`] — emitted when
+    /// verification flips `is_verified`. Wire-identical to
+    /// [`Self::meter_registered`] on purpose: consumers project both through the
+    /// same upsert.
     #[must_use]
     pub fn meter_updated(user_id: Uuid, meter: &Meter) -> Self {
         Self::from_meter(EVENT_METER_UPDATED, user_id, meter)
@@ -102,6 +112,7 @@ impl MeterEvent {
                 user_id,
                 zone_id: meter.zone_id,
                 status: status.to_string(),
+                is_verified: meter.is_verified,
                 wallet_address,
             },
         }
@@ -153,7 +164,20 @@ mod tests {
         assert_eq!(v["data"]["user_id"], uid.to_string());
         assert_eq!(v["data"]["zone_id"], 3);
         assert_eq!(v["data"]["status"], "verified");
+        assert_eq!(v["data"]["is_verified"], true);
         assert_eq!(v["data"]["wallet_address"], "WALLET123");
+    }
+
+    #[test]
+    fn updated_event_carries_the_verified_transition() {
+        // The event `verify_meter` emits so downstream read-models (trading's
+        // sell-side gate) learn a previously-unverified meter became sellable.
+        let m = meter("WALLET123", true);
+        let v =
+            serde_json::to_value(MeterEvent::meter_updated(Uuid::new_v4(), &m)).expect("serialize");
+        assert_eq!(v["event_type"], "MeterUpdated");
+        assert_eq!(v["data"]["is_verified"], true);
+        assert_eq!(v["data"]["status"], "verified");
     }
 
     #[test]
@@ -162,5 +186,6 @@ mod tests {
         let v = serde_json::to_value(&ev).expect("serialize");
         assert!(v["data"]["wallet_address"].is_null());
         assert_eq!(v["data"]["status"], "unverified");
+        assert_eq!(v["data"]["is_verified"], false);
     }
 }

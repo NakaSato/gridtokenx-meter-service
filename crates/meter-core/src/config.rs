@@ -24,6 +24,9 @@ pub struct Config {
     /// Kafka bootstrap servers for the event producer
     /// (`KAFKA_BOOTSTRAP_SERVERS`, default `kafka:9092`).
     pub kafka_bootstrap_servers: String,
+    /// How far back meter verification looks for signature-verified telemetry
+    /// (`METER_VERIFY_WINDOW_HOURS`, default 720 = 30 days). Clamped to >= 1.
+    pub verify_window_hours: i64,
 }
 
 impl Config {
@@ -49,13 +52,19 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(15);
 
-        let events_enabled = std::env::var("METER_EVENTS_ENABLED").is_ok_and(|v| {
-            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
-        });
+        let events_enabled = std::env::var("METER_EVENTS_ENABLED")
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
         let events_topic =
             std::env::var("METER_EVENTS_TOPIC").unwrap_or_else(|_| "meter_events".to_string());
         let kafka_bootstrap_servers =
             std::env::var("KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|_| "kafka:9092".to_string());
+
+        // Clamped to >= 1: a zero/negative window would fail every verification
+        // with a message blaming the device for an operator's misconfiguration.
+        let verify_window_hours: i64 = std::env::var("METER_VERIFY_WINDOW_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .map_or(720, |h| h.max(1));
 
         Ok(Self {
             database_url,
@@ -66,6 +75,7 @@ impl Config {
             events_enabled,
             events_topic,
             kafka_bootstrap_servers,
+            verify_window_hours,
         })
     }
 }
@@ -84,6 +94,7 @@ mod tests {
             "METER_SERVICE_PORT",
             "PORT",
             "METER_MINT_POLL_SECS",
+            "METER_VERIFY_WINDOW_HOURS",
         ];
         let saved: Vec<(&str, Option<String>)> =
             keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
@@ -117,6 +128,33 @@ mod tests {
         // Poll interval override (0 disables).
         std::env::set_var("METER_MINT_POLL_SECS", "0");
         assert_eq!(Config::from_env().expect("poll override").mint_poll_secs, 0);
+
+        // Verification window: default, override, and the >= 1 clamp. Unlike the
+        // poll interval, 0 must NOT mean "disabled" — it would silently make every
+        // verification unsatisfiable, so it clamps up instead.
+        assert_eq!(
+            Config::from_env()
+                .expect("default window")
+                .verify_window_hours,
+            720
+        );
+        std::env::set_var("METER_VERIFY_WINDOW_HOURS", "24");
+        assert_eq!(
+            Config::from_env()
+                .expect("window override")
+                .verify_window_hours,
+            24
+        );
+        for bad in ["0", "-5"] {
+            std::env::set_var("METER_VERIFY_WINDOW_HOURS", bad);
+            assert_eq!(
+                Config::from_env()
+                    .expect("clamped window")
+                    .verify_window_hours,
+                1,
+                "window {bad} must clamp to 1, not disable verification"
+            );
+        }
 
         // Restore prior env.
         for (k, v) in saved {

@@ -2,7 +2,7 @@
 
 use std::convert::Infallible;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
@@ -12,6 +12,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use meter_core::domain::meter::{
     Meter, MeterMapPoint, MeterReading, MeterStats, RegisterMeterRequest, RegisterMeterResponse,
+    VerifyMeterResponse,
 };
 use meter_core::error::Result;
 
@@ -115,6 +116,28 @@ pub async fn register_meter(
     let resp = state
         .meter_service
         .register_meter(user.user_id, &req)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/me/meters/{serial}/verify — prove possession of a registered
+/// meter. (legacy alias: POST /api/v1/meters/{serial}/verify)
+///
+/// Registration claims a serial; this proves the claim against telemetry the
+/// Aggregator Bridge already accepted the device signature for. Until it passes,
+/// the Trading service refuses to open sell orders backed by the meter.
+///
+/// # Errors
+/// `404` if the caller owns no meter with that serial, `409` if no attested
+/// telemetry exists yet, `500` on query failure.
+pub async fn verify_meter(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(serial): Path<String>,
+) -> Result<Json<VerifyMeterResponse>> {
+    let resp = state
+        .meter_service
+        .verify_meter(user.user_id, &serial)
         .await?;
     Ok(Json(resp))
 }

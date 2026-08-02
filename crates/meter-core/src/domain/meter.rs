@@ -193,3 +193,57 @@ pub struct RegisterMeterResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meter: Option<Meter>,
 }
+
+/// Verification method recorded on a [`MeterVerificationAttempt`].
+///
+/// Only one method exists today. It is spelled out as a constant rather than a
+/// literal so the audit trail and the failure message can never disagree about
+/// what was actually attempted.
+pub const VERIFICATION_METHOD_TELEMETRY: &str = "telemetry_attestation";
+
+/// The evidence a verification decision was made on, echoed back to the caller
+/// so a rejection is actionable ("0 attested readings in the last 720h" tells
+/// the owner to bring the device online; a stale timestamp tells them it fell
+/// off the network).
+#[derive(Debug, Clone, Serialize)]
+pub struct MeterAttestation {
+    /// Readings attributed to this (owner, meter) whose device signature the
+    /// Aggregator Bridge accepted, within the freshness window.
+    pub attested_readings: i64,
+    /// Freshness window the count was taken over, in hours.
+    pub window_hours: i64,
+}
+
+/// One row of the `meter_verification_attempts` audit trail. Written on every
+/// verification decision — success **and** failure — so a meter that flipped to
+/// verified always has the attempt that flipped it on record.
+#[derive(Debug, Clone)]
+pub struct MeterVerificationAttempt {
+    /// The user who attempted the verification.
+    pub user_id: Uuid,
+    /// Canonicalized serial of the meter being claimed.
+    pub meter_serial: String,
+    /// How possession was proven (see [`VERIFICATION_METHOD_TELEMETRY`]).
+    pub verification_method: String,
+    /// Whether the attempt verified the meter.
+    pub succeeded: bool,
+    /// Why it failed; `None` on success.
+    pub failure_reason: Option<String>,
+}
+
+/// Response for `POST /api/v1/me/meters/{serial}/verify`.
+#[derive(Debug, Serialize)]
+pub struct VerifyMeterResponse {
+    /// Whether the meter is verified as of this call (true for both a fresh
+    /// verification and a repeat call on an already-verified meter).
+    pub success: bool,
+    /// Human-readable status message.
+    pub message: String,
+    /// True when the meter was already verified and this call changed nothing.
+    pub already_verified: bool,
+    /// Evidence the decision rested on.
+    pub attestation: MeterAttestation,
+    /// The meter in its post-verification state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meter: Option<Meter>,
+}

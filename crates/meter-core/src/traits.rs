@@ -6,7 +6,9 @@
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::domain::meter::{Meter, MeterMapPoint, MeterReading, MeterStats, RegisterMeterRequest};
+use crate::domain::meter::{
+    Meter, MeterMapPoint, MeterReading, MeterStats, MeterVerificationAttempt, RegisterMeterRequest,
+};
 use crate::error::Result;
 
 /// Read/write access to meters and meter readings, scoped by owning `user_id`.
@@ -35,6 +37,30 @@ pub trait MeterRepositoryTrait: Send + Sync {
 
     /// Looks up one of the user's meters by serial number.
     async fn find_meter_by_serial(&self, user_id: Uuid, serial: &str) -> Result<Option<Meter>>;
+
+    /// Counts readings attributed to `(user_id, serial)` that the Aggregator
+    /// Bridge accepted the device signature for (`verification_status =
+    /// 'verified'`), no older than `within_hours`.
+    ///
+    /// This is the evidence behind meter verification: the bridge writes a
+    /// reading row only after Ed25519-verifying it against the device key
+    /// provisioned for that serial, so a non-zero count is proof the physical
+    /// meter is live, signing, and attributed to this owner.
+    async fn count_attested_readings(
+        &self,
+        user_id: Uuid,
+        serial: &str,
+        within_hours: i64,
+    ) -> Result<i64>;
+
+    /// Flips `meters.is_verified` to true for the user's meter and returns the
+    /// updated row. `None` when the user owns no meter with that serial — the
+    /// UPDATE is owner-scoped, so this doubles as the authorization check and
+    /// cannot verify someone else's device.
+    async fn mark_meter_verified(&self, user_id: Uuid, serial: &str) -> Result<Option<Meter>>;
+
+    /// Appends one row to the `meter_verification_attempts` audit trail.
+    async fn record_verification_attempt(&self, attempt: &MeterVerificationAttempt) -> Result<()>;
 
     /// Total number of readings owned by the user (for pagination metadata).
     async fn count_user_readings(&self, user_id: Uuid) -> Result<i64>;

@@ -66,7 +66,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         info!("Meter event publisher disabled (METER_EVENTS_ENABLED unset)");
         None
     };
-    let meter_service = MeterService::with_event_publisher(repo, event_publisher);
+    let meter_service = MeterService::with_event_publisher(repo, event_publisher)
+        .with_verify_window_hours(config.verify_window_hours);
 
     // 3. Realtime readings broadcast channel (submit → SSE subscribers).
     let (readings_tx, _) = broadcast::channel::<Arc<ReadingEvent>>(READINGS_CHANNEL_CAP);
@@ -129,6 +130,14 @@ pub fn build_app(state: AppState) -> Router {
             get(meter::stream_readings),
         )
         .route("/api/v1/me/meters/stats", get(meter::get_meter_stats))
+        // Possession proof. Distinct from registration (which only claims the
+        // serial): until this passes, Trading refuses sell orders on the meter.
+        // No conflict with the static `readings`/`stats` segments above — those
+        // are one segment past `meters`, this is two.
+        .route(
+            "/api/v1/me/meters/{serial}/verify",
+            post(meter::verify_meter),
+        )
         // Grid-wide, deliberately NOT caller-scoped (the map shows every located
         // meter across all users) — so it stays off the `/me` base.
         .route("/api/v1/meters/map", get(meter::get_meters_map))
@@ -144,6 +153,7 @@ pub fn build_app(state: AppState) -> Router {
             get(meter::stream_readings),
         )
         .route("/api/v1/meters/stats", get(meter::get_meter_stats))
+        .route("/api/v1/meters/{serial}/verify", post(meter::verify_meter))
         // Reading ingest removed: meter telemetry now flows **only** via the
         // Aggregator Bridge (Ed25519-signed IoT gateway). This service no longer
         // accepts direct reading writes; it serves the dashboard read paths and

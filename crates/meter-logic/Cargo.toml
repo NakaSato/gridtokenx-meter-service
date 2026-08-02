@@ -10,6 +10,9 @@ workspace = true
 meter-core.workspace = true
 async-trait.workspace = true
 uuid.workspace = true
+# Verification-attempt audit writes are best-effort; a failure is logged here
+# rather than propagated (see MeterService::record_attempt).
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

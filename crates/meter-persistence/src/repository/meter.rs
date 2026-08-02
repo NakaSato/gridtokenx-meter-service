@@ -6,7 +6,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use meter_core::domain::meter::{
-    Meter, MeterMapPoint, MeterReading, MeterStats, RegisterMeterRequest, ZoneFlow,
+    Meter, MeterMapPoint, MeterReading, MeterStats, MeterVerificationAttempt, RegisterMeterRequest,
+    ZoneFlow,
 };
 use meter_core::error::{ApiError, Result};
 use meter_core::traits::MeterRepositoryTrait;
@@ -299,14 +300,20 @@ impl MeterRepositoryTrait for MeterRepository {
     }
 
     async fn register_meter(&self, user_id: Uuid, req: &RegisterMeterRequest) -> Result<Meter> {
-        // is_verified = true: registration is JWT-scoped to an authenticated user and
-        // the device streams Ed25519-signed telemetry the Aggregator Bridge verifies,
-        // so the meter is verified at registration. No separate verification flow exists
-        // (the old meter_verification_attempts schema is unwired), and the trading UI
-        // gates "My Meters" on this flag — leaving it false shows every meter Unverified.
+        // is_verified = false: registration is a *claim*, not a proof. It asserts
+        // "this serial is mine" over an authenticated session and nothing more —
+        // anyone who knows an unregistered serial can make that claim. Possession
+        // of the physical device is proven separately, by
+        // `POST /api/v1/me/meters/{serial}/verify`, against signature-verified
+        // telemetry the Aggregator Bridge already accepted for this owner.
+        //
+        // This used to insert `true` on the reasoning that the device streams
+        // signed telemetry anyway — but that conflated "will eventually be
+        // provable" with "has been proven", which made the flag constant and the
+        // trading sell-side gate that reads it vacuous.
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO meters (user_id, serial_number, meter_type, location, latitude, longitude, is_verified)
-             VALUES ($1, $2, $3, $4, $5, $6, true)
+             VALUES ($1, $2, $3, $4, $5, $6, false)
              RETURNING id",
         )
         .bind(user_id)
@@ -342,6 +349,91 @@ impl MeterRepositoryTrait for MeterRepository {
                 .await?;
 
         Ok(meter)
+    }
+
+    async fn count_attested_readings(
+        &self,
+        user_id: Uuid,
+        serial: &str,
+        within_hours: i64,
+    ) -> Result<i64> {
+        // `verification_status = 'verified'` is written ONLY by the Aggregator
+        // Bridge's batch insert, and only for frames whose Ed25519 signature it
+        // accepted against the device key provisioned for that serial
+        // (`aggregator-persistence::infra::pg_readings`; the ingest paths reject
+        // unsigned/mis-signed frames fail-closed before persistence). The column
+        // defaults to 'legacy_unverified', so any row from an older or unsigned
+        // path is excluded here rather than counted as proof.
+        //
+        // Caveat worth knowing before trusting this in a hostile setting: the
+        // bridge honours dev bypasses (`SKIP_SIG_VERIFY`,
+        // `AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY`) which stamp 'verified' without
+        // checking a signature. This attestation is exactly as strong as the
+        // bridge's ingest policy — no stronger.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+               FROM meter_readings
+              WHERE user_id = $1
+                AND meter_serial = $2
+                AND verification_status = 'verified'
+                AND timestamp >= now() - make_interval(hours => $3::int)",
+        )
+        .bind(user_id)
+        .bind(serial)
+        .bind(i32::try_from(within_hours).unwrap_or(i32::MAX))
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count)
+    }
+
+    async fn mark_meter_verified(&self, user_id: Uuid, serial: &str) -> Result<Option<Meter>> {
+        // Owner-scoped UPDATE: the `user_id = $1` predicate IS the authorization
+        // check, so this can never verify a meter belonging to someone else, even
+        // if a caller reached it with another user's serial.
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE meters SET is_verified = true
+              WHERE user_id = $1 AND serial_number = $2
+              RETURNING id",
+        )
+        .bind(user_id)
+        .bind(serial)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(id) = id else { return Ok(None) };
+
+        let meter = sqlx::query_as::<_, Meter>(&meter_select("m.id = $1"))
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(Some(meter))
+    }
+
+    async fn record_verification_attempt(&self, attempt: &MeterVerificationAttempt) -> Result<()> {
+        // `attempt_status` / `attempt_result` are the schema's two status columns;
+        // both are set so a reader filtering on either sees the same verdict.
+        let status = if attempt.succeeded {
+            "success"
+        } else {
+            "failed"
+        };
+        sqlx::query(
+            "INSERT INTO meter_verification_attempts
+                 (user_id, meter_serial, verification_method, attempt_status,
+                  attempt_result, failure_reason)
+             VALUES ($1, $2, $3, $4, $4, $5)",
+        )
+        .bind(attempt.user_id)
+        .bind(&attempt.meter_serial)
+        .bind(&attempt.verification_method)
+        .bind(status)
+        .bind(attempt.failure_reason.as_deref())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 
     async fn ping(&self) -> Result<()> {
